@@ -1,0 +1,178 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.reader;
+
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.RoaringBitmap32;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.function.Function;
+
+/**
+ * A {@link RecordReader.RecordIterator} to support returning the record's row position and file
+ * Path.
+ */
+public interface FileRecordIterator<T> extends RecordReader.RecordIterator<T> {
+
+    /**
+     * Get the row position of the row returned by {@link RecordReader.RecordIterator#next}.
+     *
+     * @return the row position from 0 to the number of rows in the file
+     */
+    long returnedPosition();
+
+    /** @return the file path */
+    Path filePath();
+
+    @Override
+    default <R> FileRecordIterator<R> transform(Function<T, R> function) {
+        FileRecordIterator<T> thisIterator = this;
+        return new FileRecordIterator<R>() {
+            @Override
+            public long returnedPosition() {
+                return thisIterator.returnedPosition();
+            }
+
+            @Override
+            public Path filePath() {
+                return thisIterator.filePath();
+            }
+
+            @Nullable
+            @Override
+            public R next() throws IOException {
+                T next = thisIterator.next();
+                if (next == null) {
+                    return null;
+                }
+                return function.apply(next);
+            }
+
+            @Override
+            public boolean skip() throws IOException {
+                return thisIterator.skip();
+            }
+
+            @Override
+            public void releaseBatch() {
+                thisIterator.releaseBatch();
+            }
+        };
+    }
+
+    @Override
+    default FileRecordIterator<T> filter(Filter<T> filter) {
+        FileRecordIterator<T> thisIterator = this;
+        return new FileRecordIterator<T>() {
+            @Override
+            public long returnedPosition() {
+                return thisIterator.returnedPosition();
+            }
+
+            @Override
+            public Path filePath() {
+                return thisIterator.filePath();
+            }
+
+            @Nullable
+            @Override
+            public T next() throws IOException {
+                while (true) {
+                    T next = thisIterator.next();
+                    if (next == null) {
+                        return null;
+                    }
+                    if (filter.test(next)) {
+                        return next;
+                    }
+                }
+            }
+
+            @Override
+            public void releaseBatch() {
+                thisIterator.releaseBatch();
+            }
+        };
+    }
+
+    default FileRecordIterator<T> selection(RoaringBitmap32 selection) {
+        FileRecordIterator<T> thisIterator = this;
+        return new FileRecordIterator<T>() {
+            private long nextExpected = selection.nextValue(0);
+
+            @Override
+            public long returnedPosition() {
+                return thisIterator.returnedPosition();
+            }
+
+            @Override
+            public Path filePath() {
+                return thisIterator.filePath();
+            }
+
+            @Nullable
+            @Override
+            public T next() throws IOException {
+                while (true) {
+                    if (nextExpected == -1) {
+                        return null;
+                    }
+                    T next = thisIterator.next();
+                    if (next == null) {
+                        return null;
+                    }
+                    if (isSelected()) {
+                        return next;
+                    }
+                }
+            }
+
+            @Override
+            public boolean skip() throws IOException {
+                while (true) {
+                    if (nextExpected == -1 || !thisIterator.skip()) {
+                        return false;
+                    }
+                    if (isSelected()) {
+                        return true;
+                    }
+                }
+            }
+
+            private boolean isSelected() {
+                long position = returnedPosition();
+                if (nextExpected < position) {
+                    // A batch may start far into the file or skip entire pages. Seek to its
+                    // position instead of walking the selection again from the file's start.
+                    nextExpected =
+                            position > 0xFFFFFFFFL ? -1 : selection.nextValue((int) position);
+                }
+                return nextExpected == position;
+            }
+
+            @Override
+            public void releaseBatch() {
+                thisIterator.releaseBatch();
+            }
+        };
+    }
+}

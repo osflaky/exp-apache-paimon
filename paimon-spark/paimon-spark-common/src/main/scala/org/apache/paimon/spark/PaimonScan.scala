@@ -1,0 +1,182 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark
+
+import org.apache.paimon.CoreOptions.BucketFunctionType
+import org.apache.paimon.partition.PartitionPredicate
+import org.apache.paimon.predicate.{FullTextSearch, HybridSearch, Predicate, TopN, VectorSearch}
+import org.apache.paimon.spark.catalog.functions.BucketFunction
+import org.apache.paimon.spark.commands.BucketExpression.quote
+import org.apache.paimon.spark.read.{BinPackingSplits, VariantExtractionInfo}
+import org.apache.paimon.table.{BucketMode, FileStoreTable, InnerTable}
+import org.apache.paimon.table.source.{DataSplit, Split}
+
+import org.apache.spark.sql.PaimonUtils.fieldReference
+import org.apache.spark.sql.connector.expressions._
+import org.apache.spark.sql.connector.expressions.filter.{Predicate => SparkPredicate}
+import org.apache.spark.sql.connector.read.{SupportsReportOrdering, SupportsReportPartitioning, SupportsRuntimeV2Filtering}
+import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
+import org.apache.spark.sql.types.StructType
+
+import scala.collection.JavaConverters._
+
+case class PaimonScan(
+    table: InnerTable,
+    requiredSchema: StructType,
+    pushedPartitionFilters: Seq[PartitionPredicate],
+    pushedDataFilters: Seq[Predicate],
+    override val pushedLimit: Option[Int],
+    override val pushedTopN: Option[TopN],
+    override val pushedVectorSearch: Option[VectorSearch],
+    override val pushedHybridSearch: Option[HybridSearch] = None,
+    override val pushedFullTextSearch: Option[FullTextSearch] = None,
+    override val pushedVariantExtractions: Map[Seq[String], Seq[VariantExtractionInfo]] = Map.empty,
+    override val pushedMapSelectedKeys: Map[String, Seq[String]] = Map.empty,
+    preserveDataGrouping: Boolean = false)
+  extends PaimonBaseScan(table)
+  with SupportsReportPartitioning
+  with SupportsReportOrdering {
+
+  @transient
+  private lazy val extractBucketTransform: Option[Transform] = {
+    table match {
+      case fileStoreTable: FileStoreTable =>
+        val bucketSpec = fileStoreTable.bucketSpec()
+        // todo introduce bucket transform for different bucket function type
+        if (
+          bucketSpec.getBucketMode != BucketMode.HASH_FIXED || coreOptions
+            .bucketFunctionType() != BucketFunctionType.DEFAULT
+        ) {
+          None
+        } else if (!BucketFunction.supportsTable(fileStoreTable)) {
+          // Spark tells two scans apart by the canonical name of the bound bucket function, which
+          // is derived from Spark types. Spark's timestamp precision is fixed to 6, so bucket keys
+          // carrying any other precision are indistinguishable there, while Paimon lays their
+          // BinaryRow out differently and thus puts the same value into a different bucket.
+          // Reporting a bucket transform would let Spark treat such tables as co-partitioned and
+          // drop a shuffle that is actually required. This mirrors the same check the write side
+          // already does in `PaimonSparkWriter`.
+          None
+        } else if (bucketSpec.getBucketKeys.size() > 1) {
+          None
+        } else {
+          // Spark does not support bucket with several input attributes,
+          // so we only support one bucket key case.
+          assert(bucketSpec.getNumBuckets > 0)
+          assert(bucketSpec.getBucketKeys.size() == 1)
+          extractBucketNumber() match {
+            case Some(num) =>
+              val bucketKey = bucketSpec.getBucketKeys.get(0)
+              if (requiredSchema.exists(f => conf.resolver(f.name, bucketKey))) {
+                Some(Expressions.bucket(num, quote(bucketKey)))
+              } else {
+                None
+              }
+
+            case _ => None
+          }
+        }
+
+      case _ => None
+    }
+  }
+
+  /** Extract the bucket number from the splits only if all splits have the same totalBuckets number. */
+  private def extractBucketNumber(): Option[Int] = {
+    val splits = inputSplits
+    if (splits.exists(!_.isInstanceOf[DataSplit])) {
+      None
+    } else {
+      val deduplicated =
+        splits.map(s => Option(s.asInstanceOf[DataSplit].totalBuckets())).toSeq.distinct
+
+      deduplicated match {
+        case Seq(Some(num)) => Some(num)
+        case _ => None
+      }
+    }
+  }
+
+  private def shouldDoBucketedScan: Boolean = {
+    preserveDataGrouping && extractBucketTransform.isDefined
+  }
+
+  // Since Spark 3.3
+  override def outputPartitioning: Partitioning = {
+    if (shouldDoBucketedScan) {
+      new KeyGroupedPartitioning(Array(extractBucketTransform.get), inputPartitions.size)
+    } else {
+      new UnknownPartitioning(0)
+    }
+  }
+
+  // Since Spark 3.4
+  override def outputOrdering(): Array[SortOrder] = {
+    if (
+      !shouldDoBucketedScan || inputPartitions.exists(!_.isInstanceOf[PaimonBucketedInputPartition])
+    ) {
+      return Array.empty
+    }
+
+    val primaryKeys = table match {
+      case fileStoreTable: FileStoreTable => fileStoreTable.primaryKeys().asScala
+      case _ => Seq.empty
+    }
+    if (primaryKeys.isEmpty) {
+      return Array.empty
+    }
+
+    val allSplitsKeepOrdering = inputPartitions.toSeq
+      .map(_.asInstanceOf[PaimonBucketedInputPartition])
+      .map(_.splits.asInstanceOf[Seq[DataSplit]])
+      .forall {
+        splits =>
+          // Only support report ordering if all matches:
+          // - one `Split` per InputPartition (TODO: Re-construct splits using minKey/maxKey)
+          // - `Split` is not rawConvertible so that the merge read can happen
+          // - `Split` only contains one data file so it always sorted even without merge read
+          splits.size < 2 && splits.forall {
+            split => !split.rawConvertible() || split.dataFiles().size() < 2
+          }
+      }
+    if (!allSplitsKeepOrdering) {
+      return Array.empty
+    }
+
+    // Multi-primary keys are fine:
+    // `Array(a, b)` satisfies the required ordering `Array(a)`
+    primaryKeys
+      .map(Expressions.identity)
+      .map {
+        sortExpr =>
+          // Paimon MergeTree comparators and Spark ascending expressions both order nulls first.
+          Expressions.sort(sortExpr, SortDirection.ASCENDING)
+      }
+      .toArray
+  }
+
+  override protected def getInputPartitions(splits: Array[Split]): Seq[PaimonInputPartition] = {
+    if (!shouldDoBucketedScan || splits.exists(!_.isInstanceOf[DataSplit])) {
+      return super.getInputPartitions(splits)
+    }
+
+    BinPackingSplits(coreOptions, readRowSizeRatio)
+      .packByBucket(splits.map(_.asInstanceOf[DataSplit]))
+  }
+}

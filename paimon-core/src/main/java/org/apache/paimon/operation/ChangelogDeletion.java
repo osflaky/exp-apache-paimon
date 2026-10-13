@@ -1,0 +1,147 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.operation;
+
+import org.apache.paimon.Changelog;
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.index.IndexFileHandler;
+import org.apache.paimon.index.IndexFileMeta;
+import org.apache.paimon.manifest.ExpireFileEntry;
+import org.apache.paimon.manifest.IndexManifestEntry;
+import org.apache.paimon.manifest.ManifestFile;
+import org.apache.paimon.manifest.ManifestList;
+import org.apache.paimon.stats.StatsFileHandler;
+import org.apache.paimon.utils.FileStorePathFactory;
+
+import javax.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
+
+/** Delete changelog files. */
+public class ChangelogDeletion extends FileDeletionBase<Changelog> {
+
+    public ChangelogDeletion(
+            FileIO fileIO,
+            FileStorePathFactory pathFactory,
+            ManifestFile manifestFile,
+            ManifestList manifestList,
+            IndexFileHandler indexFileHandler,
+            StatsFileHandler statsFileHandler,
+            boolean cleanEmptyDirectories,
+            int fileOperationThreadNum,
+            @Nullable Integer manifestReadParallelism) {
+        super(
+                fileIO,
+                pathFactory,
+                manifestFile,
+                manifestList,
+                indexFileHandler,
+                statsFileHandler,
+                cleanEmptyDirectories,
+                fileOperationThreadNum,
+                manifestReadParallelism);
+    }
+
+    @Override
+    public void cleanDeletedDataFiles(Changelog changelog, Predicate<ExpireFileEntry> skipper) {
+        if (changelog.changelogManifestList() != null) {
+            cleanDataFiles(planAddedInChangelogManifest(changelog));
+        } else {
+            cleanDataFiles(planDeletedInDeltaManifest(changelog, skipper));
+        }
+    }
+
+    @Override
+    public void cleanUnusedManifests(Changelog changelog, Set<String> skippingSet) {
+        if (changelog.changelogManifestList() != null) {
+            cleanUnusedManifestList(changelog.changelogManifestList(), skippingSet);
+        } else {
+            if (manifestList.exists(changelog.deltaManifestList())) {
+                cleanUnusedManifestList(changelog.deltaManifestList(), skippingSet);
+            }
+            // See FileDeletionBase#cleanUnusedManifests
+            // about why we need to clean base manifest
+            if (manifestList.exists(changelog.baseManifestList())) {
+                cleanUnusedManifestList(changelog.baseManifestList(), skippingSet);
+            }
+        }
+
+        // the index and statistics manifest list should handle by snapshot deletion.
+    }
+
+    @Override
+    public Set<String> manifestSkippingSet(List<Snapshot> skippingSnapshots) {
+        Set<String> skippingSet = new HashSet<>();
+
+        for (Snapshot skippingSnapshot : skippingSnapshots) {
+            // base manifests
+            if (manifestList.exists(skippingSnapshot.baseManifestList())) {
+                skippingSet.add(skippingSnapshot.baseManifestList());
+                manifestList
+                        .read(skippingSnapshot.baseManifestList())
+                        .forEach(manifest -> addManifestToSkippingSet(skippingSet, manifest));
+            }
+
+            // delta manifests
+            if (manifestList.exists(skippingSnapshot.deltaManifestList())) {
+                skippingSet.add(skippingSnapshot.deltaManifestList());
+                manifestList
+                        .read(skippingSnapshot.deltaManifestList())
+                        .forEach(manifest -> addManifestToSkippingSet(skippingSet, manifest));
+            }
+
+            // index manifests
+            String indexManifest = skippingSnapshot.indexManifest();
+            if (indexManifest != null && indexFileHandler.existsManifest(indexManifest)) {
+                skippingSet.add(indexManifest);
+                indexFileHandler.readManifest(indexManifest).stream()
+                        .map(IndexManifestEntry::indexFile)
+                        .map(IndexFileMeta::fileName)
+                        .forEach(skippingSet::add);
+            }
+
+            // statistics
+            if (skippingSnapshot.statistics() != null) {
+                skippingSet.add(skippingSnapshot.statistics());
+            }
+        }
+
+        return skippingSet;
+    }
+
+    public void cleanUnusedManifestList(String manifestName, Set<String> skippingSet) {
+        executeAll(planUnusedManifestList(manifestName, skippingSet));
+    }
+
+    public List<Runnable> planUnusedManifestList(String manifestName, Set<String> skippingSet) {
+        Set<String> manifests = new LinkedHashSet<>();
+        collectUnusedManifestList(manifestName, skippingSet, manifests);
+        List<Runnable> tasks = new ArrayList<>();
+        for (String manifest : manifests) {
+            tasks.add(() -> manifestFile.delete(manifest));
+        }
+        return tasks;
+    }
+}

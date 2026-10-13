@@ -1,0 +1,444 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.types;
+
+import org.assertj.core.api.Assertions;
+import org.assertj.core.api.ObjectAssert;
+import org.assertj.core.api.ThrowingConsumer;
+import org.junit.jupiter.api.Test;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Test for subclasses of {@link DataType}. */
+public class DataTypesTest {
+
+    @Test
+    void testCharType() {
+        assertThat(new CharType(33))
+                .satisfies(baseAssertions("CHAR(33)", new CharType(Integer.MAX_VALUE)));
+    }
+
+    @Test
+    void testVarCharType() {
+        assertThat(new VarCharType(33))
+                .satisfies(baseAssertions("VARCHAR(33)", new VarCharType(12)));
+    }
+
+    @Test
+    void testVarCharTypeWithMaximumLength() {
+        assertThat(new VarCharType(Integer.MAX_VALUE))
+                .satisfies(baseAssertions("STRING", new VarCharType(12)));
+    }
+
+    @Test
+    void testBooleanType() {
+        assertThat(new BooleanType()).satisfies(baseAssertions("BOOLEAN", new BooleanType(false)));
+    }
+
+    @Test
+    void testBinaryType() {
+        assertThat(new BinaryType(22)).satisfies(baseAssertions("BINARY(22)", new BinaryType()));
+    }
+
+    @Test
+    void testVarBinaryType() {
+        assertThat(new VarBinaryType(22))
+                .satisfies(baseAssertions("VARBINARY(22)", new VarBinaryType()));
+    }
+
+    @Test
+    void testVarBinaryTypeWithMaximumLength() {
+        assertThat(new VarBinaryType(Integer.MAX_VALUE))
+                .satisfies(baseAssertions("BYTES", new VarBinaryType(12)));
+    }
+
+    @Test
+    void testDecimalType() {
+        assertThat(new DecimalType(10, 2))
+                .satisfies(baseAssertions("DECIMAL(10, 2)", new DecimalType()));
+    }
+
+    @Test
+    void testTinyIntType() {
+        assertThat(new TinyIntType()).satisfies(baseAssertions("TINYINT", new TinyIntType(false)));
+    }
+
+    @Test
+    void testSmallIntType() {
+        assertThat(new SmallIntType())
+                .satisfies(baseAssertions("SMALLINT", new SmallIntType(false)));
+    }
+
+    @Test
+    void testIntType() {
+        assertThat(new IntType()).satisfies(baseAssertions("INT", new IntType(false)));
+    }
+
+    @Test
+    void testBigIntType() {
+        assertThat(new BigIntType()).satisfies(baseAssertions("BIGINT", new BigIntType(false)));
+    }
+
+    @Test
+    void testFloatType() {
+        assertThat(new FloatType()).satisfies(baseAssertions("FLOAT", new FloatType(false)));
+    }
+
+    @Test
+    void testDoubleType() {
+        assertThat(new DoubleType()).satisfies(baseAssertions("DOUBLE", new DoubleType(false)));
+    }
+
+    @Test
+    void testDateType() {
+        assertThat(new DateType()).satisfies(baseAssertions("DATE", new DateType(false)));
+    }
+
+    @Test
+    void testTimeType() {
+        assertThat(new TimeType(9)).satisfies(baseAssertions("TIME(9)", new TimeType()));
+    }
+
+    @Test
+    void testTimestampType() {
+        assertThat(new TimestampType(9))
+                .satisfies(baseAssertions("TIMESTAMP(9)", new TimestampType(3)));
+    }
+
+    @Test
+    void testLocalZonedTimestampType() {
+        assertThat(new LocalZonedTimestampType(9))
+                .satisfies(
+                        baseAssertions(
+                                "TIMESTAMP(9) WITH LOCAL TIME ZONE",
+                                new LocalZonedTimestampType(3)));
+    }
+
+    @Test
+    void testArrayType() {
+        assertThat(new ArrayType(new TimestampType()))
+                .satisfies(
+                        baseAssertions("ARRAY<TIMESTAMP(6)>", new ArrayType(new SmallIntType())));
+
+        assertThat(new ArrayType(new ArrayType(new TimestampType())))
+                .satisfies(
+                        baseAssertions(
+                                "ARRAY<ARRAY<TIMESTAMP(6)>>",
+                                new ArrayType(new ArrayType(new SmallIntType()))));
+    }
+
+    @Test
+    void testMultisetType() {
+        assertThat(new MultisetType(new TimestampType()))
+                .satisfies(
+                        baseAssertions(
+                                "MULTISET<TIMESTAMP(6)>", new MultisetType(new SmallIntType())));
+
+        assertThat(new MultisetType(new MultisetType(new TimestampType())))
+                .satisfies(
+                        baseAssertions(
+                                "MULTISET<MULTISET<TIMESTAMP(6)>>",
+                                new MultisetType(new MultisetType(new SmallIntType()))));
+    }
+
+    @Test
+    void testMapType() {
+        assertThat(new MapType(new VarCharType(20), new TimestampType()))
+                .satisfies(
+                        baseAssertions(
+                                "MAP<VARCHAR(20), TIMESTAMP(6)>",
+                                new MapType(new VarCharType(99), new TimestampType())));
+    }
+
+    @Test
+    void testRowType() {
+        assertThat(
+                        new RowType(
+                                Arrays.asList(
+                                        new DataField(0, "a", new VarCharType(), "Someone's desc."),
+                                        new DataField(1, "b`", new TimestampType()))))
+                .satisfies(
+                        baseAssertions(
+                                "ROW<`a` VARCHAR(1) COMMENT 'Someone''s desc.', `b``` TIMESTAMP(6)>",
+                                new RowType(
+                                        Arrays.asList(
+                                                new DataField(
+                                                        0,
+                                                        "a",
+                                                        new VarCharType(),
+                                                        "Different desc."),
+                                                new DataField(1, "b`", new TimestampType())))));
+
+        assertThatThrownBy(
+                        () ->
+                                new RowType(
+                                        Arrays.asList(
+                                                new DataField(0, "b", new VarCharType()),
+                                                new DataField(1, "b", new VarCharType()),
+                                                new DataField(2, "a", new VarCharType()),
+                                                new DataField(3, "a", new TimestampType()))))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        assertThatThrownBy(
+                        () ->
+                                new RowType(
+                                        Collections.singletonList(
+                                                new DataField(0, "", new VarCharType()))))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void testProjectByPaths() {
+        RowType type =
+                new RowType(
+                        Arrays.asList(
+                                new DataField(0, "id", DataTypes.INT()),
+                                new DataField(
+                                        1,
+                                        "nest",
+                                        DataTypes.ROW(
+                                                new DataField(2, "a", DataTypes.INT()),
+                                                new DataField(3, "b", DataTypes.STRING())))));
+
+        // dotted path selects only the addressed sub-field, preserving ids
+        RowType onlyNestA = type.projectByPaths(Collections.singletonList("nest.a"));
+        Assertions.assertThat(onlyNestA.getFieldNames()).containsExactly("nest");
+        RowType nestSub = (RowType) onlyNestA.getField("nest").type();
+        Assertions.assertThat(nestSub.getFieldNames()).containsExactly("a");
+        Assertions.assertThat(nestSub.getField("a").id()).isEqualTo(2);
+
+        // a plain top-level name selects the whole field
+        RowType wholeNest =
+                (RowType)
+                        type.projectByPaths(Collections.singletonList("nest"))
+                                .getField("nest")
+                                .type();
+        Assertions.assertThat(wholeNest.getFieldNames()).containsExactly("a", "b");
+
+        // mixing a whole column and a sub-field
+        Assertions.assertThat(type.projectByPaths(Arrays.asList("id", "nest.b")).getFieldNames())
+                .containsExactly("id", "nest");
+
+        // a dotted path whose head is not a ROW is rejected (not silently widened to the scalar)
+        assertThatThrownBy(() -> type.projectByPaths(Collections.singletonList("id.a")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("non-ROW field 'id'");
+
+        // an unknown path is rejected
+        assertThatThrownBy(() -> type.projectByPaths(Collections.singletonList("missing")))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        // a column whose name itself contains a dot is matched exactly (not split)
+        RowType dotted =
+                new RowType(Collections.singletonList(new DataField(0, "a.b", DataTypes.INT())));
+        Assertions.assertThat(
+                        dotted.projectByPaths(Collections.singletonList("a.b")).getFieldNames())
+                .containsExactly("a.b");
+    }
+
+    /**
+     * projectByPaths replaced project(List) in TableSchema.project(writeCols), which rebuilds the
+     * physical layout of a data file from the column order recorded in its writeCols. That order is
+     * not guaranteed to be the schema declaration order, so the two must agree field-for-field —
+     * including when the requested names are given out of schema order.
+     */
+    @Test
+    void testProjectByPathsMatchesLegacyProjectIncludingOrder() {
+        RowType type =
+                new RowType(
+                        Arrays.asList(
+                                new DataField(0, "id", DataTypes.INT()),
+                                new DataField(1, "name", DataTypes.STRING()),
+                                new DataField(
+                                        2,
+                                        "nest",
+                                        DataTypes.ROW(
+                                                new DataField(3, "a", DataTypes.INT()),
+                                                new DataField(4, "b", DataTypes.STRING())))));
+
+        for (List<String> names :
+                Arrays.asList(
+                        Arrays.asList("id", "name", "nest"),
+                        Arrays.asList("nest", "id"),
+                        Arrays.asList("name", "nest", "id"),
+                        Collections.singletonList("nest"))) {
+            Assertions.assertThat(type.projectByPaths(names))
+                    .as("projectByPaths must equal project for plain names %s", names)
+                    .isEqualTo(type.project(names));
+        }
+
+        // the projected order follows the given paths, not the schema declaration order
+        Assertions.assertThat(type.projectByPaths(Arrays.asList("nest", "id")).getFieldNames())
+                .containsExactly("nest", "id");
+        // ... and that holds when a dotted sub-field path is mixed in
+        Assertions.assertThat(type.projectByPaths(Arrays.asList("nest.b", "id")).getFieldNames())
+                .containsExactly("nest", "id");
+        // within a struct, sub-fields also follow the given order
+        RowType reordered = type.projectByPaths(Arrays.asList("nest.b", "nest.a"));
+        Assertions.assertThat(((RowType) reordered.getField("nest").type()).getFieldNames())
+                .containsExactly("b", "a");
+        // ... and collectLeafPaths does not collapse it to the whole column name: coversFully
+        // requires the same physical order as the full type, not just the same field ids, so a
+        // complete-but-reordered struct is still treated as a partial (order-preserving) write.
+        // Collapsing it to "nest" would let a reader reconstruct schema-declaration order (a, b)
+        // instead of the physical write order (b, a).
+        Assertions.assertThat(reordered.collectLeafPaths(type)).containsExactly("nest.b", "nest.a");
+    }
+
+    /**
+     * collectLeafPaths replaced getFieldNames() on the write path, and its result is persisted into
+     * the manifest as writeCols. Metadata written there is permanent, so for any write type that
+     * contains no partially-written struct the two must produce exactly the same list.
+     */
+    @Test
+    void testCollectLeafPathsEqualsFieldNamesWithoutPartialStruct() {
+        RowType full =
+                new RowType(
+                        Arrays.asList(
+                                new DataField(0, "id", DataTypes.INT()),
+                                new DataField(1, "name", DataTypes.STRING()),
+                                new DataField(
+                                        2,
+                                        "nest",
+                                        DataTypes.ROW(
+                                                new DataField(3, "a", DataTypes.INT()),
+                                                new DataField(4, "b", DataTypes.STRING())))));
+
+        for (List<String> names :
+                Arrays.asList(
+                        Arrays.asList("id", "name", "nest"),
+                        Arrays.asList("nest", "id"),
+                        Collections.singletonList("nest"),
+                        Collections.singletonList("id"))) {
+            RowType writeType = full.projectByPaths(names);
+            Assertions.assertThat(writeType.collectLeafPaths(full))
+                    .as(
+                            "collectLeafPaths must equal getFieldNames for whole-column write type %s",
+                            names)
+                    .isEqualTo(writeType.getFieldNames());
+        }
+
+        // a field absent from the reference type (row-tracking system fields) is emitted whole
+        RowType withSystemField =
+                new RowType(
+                        Arrays.asList(
+                                new DataField(0, "id", DataTypes.INT()),
+                                new DataField(-1, "_ROW_ID", DataTypes.BIGINT())));
+        Assertions.assertThat(withSystemField.collectLeafPaths(full))
+                .isEqualTo(withSystemField.getFieldNames());
+
+        // a top-level column whose name contains a dot is still emitted whole, not rejected
+        RowType dotted =
+                new RowType(Collections.singletonList(new DataField(0, "a.b", DataTypes.INT())));
+        Assertions.assertThat(dotted.collectLeafPaths(dotted)).containsExactly("a.b");
+    }
+
+    @Test
+    void testCollectLeafPaths() {
+        RowType full =
+                new RowType(
+                        Arrays.asList(
+                                new DataField(0, "id", DataTypes.INT()),
+                                new DataField(
+                                        1,
+                                        "nest",
+                                        DataTypes.ROW(
+                                                new DataField(2, "a", DataTypes.INT()),
+                                                new DataField(
+                                                        3,
+                                                        "sub",
+                                                        DataTypes.ROW(
+                                                                new DataField(
+                                                                        4, "x", DataTypes.INT()),
+                                                                new DataField(
+                                                                        5,
+                                                                        "y",
+                                                                        DataTypes.INT())))))));
+
+        // a full write collapses to top-level names (no dotted paths)
+        Assertions.assertThat(full.collectLeafPaths(full)).containsExactly("id", "nest");
+
+        // one level of partial nesting: a direct sub-field of a top-level struct
+        Assertions.assertThat(
+                        full.projectByPaths(Collections.singletonList("nest.a"))
+                                .collectLeafPaths(full))
+                .containsExactly("nest.a");
+
+        // a whole sub-struct under a partial top-level struct is still one level
+        Assertions.assertThat(
+                        full.projectByPaths(Collections.singletonList("nest.sub"))
+                                .collectLeafPaths(full))
+                .containsExactly("nest.sub");
+
+        // deeper than one level (a partial sub-struct) is rejected so it can never be committed
+        RowType deepPartial = full.projectByPaths(Collections.singletonList("nest.sub.x"));
+        assertThatThrownBy(() -> deepPartial.collectLeafPaths(full))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("one level");
+    }
+
+    // --------------------------------------------------------------------------------------------
+
+    private static ThrowingConsumer<DataType> baseAssertions(String sqlString, DataType otherType) {
+        return nullableType ->
+                assertThat(nullableType)
+                        .satisfies(nonEqualityCheckWithOtherType(otherType))
+                        .satisfies(DataTypesTest::nullability)
+                        .isJavaSerializable()
+                        .hasSQLString(sqlString);
+    }
+
+    private static ThrowingConsumer<DataType> nonEqualityCheckWithOtherType(DataType otherType) {
+        return nullableType -> {
+            assertThat(nullableType)
+                    .isNullable()
+                    .isEqualTo(nullableType)
+                    .isEqualTo(nullableType.copy())
+                    .isNotEqualTo(otherType);
+
+            assertThat(nullableType.hashCode())
+                    .isEqualTo(nullableType.hashCode())
+                    .isNotEqualTo(otherType.hashCode());
+        };
+    }
+
+    private static void nullability(DataType nullableType) {
+        final DataType notNullInstance = nullableType.copy(false);
+        assertThat(notNullInstance).isNotNullable();
+        assertThat(nullableType).isNotEqualTo(notNullInstance);
+    }
+
+    private static final DataType UDT_NAME_TYPE = new VarCharType();
+
+    private static final DataType UDT_SETTING_TYPE = new IntType();
+
+    private static final DataType UDT_TIMESTAMP_TYPE = new TimestampType();
+
+    public static DataTypeAssert assertThat(DataType actual) {
+        return new DataTypeAssert(actual);
+    }
+
+    public static <T> ObjectAssert<T> assertThat(T actual) {
+        return Assertions.assertThat(actual);
+    }
+}

@@ -1,0 +1,136 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.operation;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.manifest.ManifestFile;
+import org.apache.paimon.manifest.ManifestFileMeta;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.ExceptionUtils;
+
+import javax.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+import static org.apache.paimon.manifest.ManifestFileMeta.allContainsRowId;
+
+/** Manifest file merger with standard merge logic and optional sort rewrite. */
+public class ManifestFileMerger {
+
+    /**
+     * Merge several {@link ManifestFileMeta}s. {@link ManifestEntry}s representing first adding and
+     * then deleting the same data file will cancel each other.
+     *
+     * <p>NOTE: This method is atomic.
+     */
+    public static List<ManifestFileMeta> merge(
+            List<ManifestFileMeta> input,
+            ManifestFile manifestFile,
+            RowType partitionType,
+            CoreOptions options) {
+        return merge(input, manifestFile, partitionType, options, null);
+    }
+
+    public static List<ManifestFileMeta> merge(
+            List<ManifestFileMeta> input,
+            ManifestFile manifestFile,
+            RowType partitionType,
+            CoreOptions options,
+            @Nullable IOManager ioManager) {
+        return merge(input, manifestFile, partitionType, options, ioManager, false);
+    }
+
+    static List<ManifestFileMeta> merge(
+            List<ManifestFileMeta> input,
+            ManifestFile manifestFile,
+            RowType partitionType,
+            CoreOptions options,
+            @Nullable IOManager ioManager,
+            boolean fullCompaction) {
+        // these are the newly created manifest files, clean them up if exception occurs
+        List<ManifestFileMeta> newFilesForAbort = new ArrayList<>();
+
+        try {
+            // Bucketed tables and data evolution tables with complete RowID ranges do not require
+            // partition fields for manifest sort rewrite.
+            if (canUseManifestSort(input, partitionType, options)) {
+                return ManifestFileSorter.trySortCompaction(
+                        input,
+                        newFilesForAbort,
+                        manifestFile,
+                        partitionType,
+                        options,
+                        ioManager,
+                        fullCompaction);
+            }
+
+            if (options.manifestMergeOptimizeEnabled()) {
+                return ManifestFileBlockMerger.merge(
+                        input, newFilesForAbort, manifestFile, partitionType, options);
+            }
+            return ManifestFileLegacyMerger.merge(
+                    input, newFilesForAbort, manifestFile, partitionType, options);
+        } catch (Throwable primaryFailure) {
+            // exception occurs, clean up and rethrow
+            for (ManifestFileMeta manifest : newFilesForAbort) {
+                try {
+                    manifestFile.delete(manifest);
+                } catch (Throwable cleanupFailure) {
+                    primaryFailure =
+                            ExceptionUtils.firstOrSuppressed(cleanupFailure, primaryFailure);
+                }
+            }
+            ExceptionUtils.rethrow(primaryFailure);
+            return null;
+        }
+    }
+
+    static boolean canUseManifestSort(
+            List<ManifestFileMeta> input, RowType partitionType, CoreOptions options) {
+        return options.manifestSortEnabled()
+                && (partitionType.getFieldCount() > 0
+                        || options.bucket() > 0
+                        || options.bucket() == BucketMode.POSTPONE_BUCKET
+                        || (options.dataEvolutionEnabled() && allContainsRowId(input)));
+    }
+
+    public static Optional<List<ManifestFileMeta>> tryFullCompaction(
+            List<ManifestFileMeta> inputs,
+            List<ManifestFileMeta> newFilesForAbort,
+            ManifestFile manifestFile,
+            long suggestedMetaSize,
+            long sizeTrigger,
+            RowType partitionType,
+            @Nullable Integer manifestReadParallelism)
+            throws Exception {
+        return ManifestFileBlockMerger.tryFullCompaction(
+                inputs,
+                newFilesForAbort,
+                manifestFile,
+                suggestedMetaSize,
+                sizeTrigger,
+                partitionType,
+                manifestReadParallelism);
+    }
+}

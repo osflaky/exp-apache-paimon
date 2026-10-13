@@ -1,0 +1,92 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.table.source;
+
+import org.apache.paimon.annotation.Experimental;
+import org.apache.paimon.annotation.Public;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.globalindex.GlobalIndexResult;
+import org.apache.paimon.manifest.PartitionEntry;
+import org.apache.paimon.metrics.MetricRegistry;
+import org.apache.paimon.table.Table;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * A scan of {@link Table} to generate {@link Split} splits.
+ *
+ * @since 0.4.0
+ */
+@Public
+public interface TableScan {
+
+    /** Set {@link MetricRegistry} to table scan. */
+    TableScan withMetricRegistry(MetricRegistry registry);
+
+    /**
+     * Specify the global index result to be read. This is usually used to search vector index in
+     * data-evolution table.
+     */
+    TableScan withGlobalIndexResult(GlobalIndexResult globalIndexResult);
+
+    /** Plan splits, throws {@link EndOfScanException} if the scan is ended. */
+    Plan plan();
+
+    /** List partitions. */
+    default List<BinaryRow> listPartitions() {
+        return listPartitionEntries().stream()
+                .map(PartitionEntry::partition)
+                .collect(Collectors.toList());
+    }
+
+    List<PartitionEntry> listPartitionEntries();
+
+    /**
+     * Returns all non-empty partitions belonging to the top {@code num} distinct partition
+     * prefixes.
+     *
+     * <p>A prefix consists of the first {@code partitionFieldCount} partition fields. Prefixes and
+     * returned partitions are ordered descending by their logical field types. All returned rows
+     * contain the complete partition, so selecting a prefix may return more than {@code num} rows.
+     * Null values, including default partitions, are ordered below non-null values. The current
+     * scan's partition filters are respected.
+     *
+     * <p>This operation is only supported for batch scans of partitioned tables. {@code num} must
+     * be positive, and {@code partitionFieldCount} must be between one and the number of partition
+     * fields.
+     *
+     * @since 2.2.0
+     */
+    @Experimental
+    default List<BinaryRow> topNPartitions(int num, int partitionFieldCount) {
+        throw new UnsupportedOperationException(
+                "Finding top partitions is not supported by " + getClass().getName() + ".");
+    }
+
+    /**
+     * Plan of scan.
+     *
+     * @since 0.4.0
+     */
+    @Public
+    interface Plan {
+        List<Split> splits();
+    }
+}

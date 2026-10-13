@@ -1,0 +1,395 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.io;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.KeyValue;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.deletionvectors.ApplyDeletionVectorReader;
+import org.apache.paimon.deletionvectors.DeletionVector;
+import org.apache.paimon.format.FileFormatDiscover;
+import org.apache.paimon.format.FormatKey;
+import org.apache.paimon.format.FormatReaderContext;
+import org.apache.paimon.format.OrcFormatReaderContext;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.manifest.FileSource;
+import org.apache.paimon.partition.PartitionUtils;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.reader.FileRecordReader;
+import org.apache.paimon.reader.ReadBatchSizer;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.KeyValueFieldsExtractor;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.AsyncRecordReader;
+import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.FormatReaderMapping;
+import org.apache.paimon.utils.Preconditions;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+/** Factory to create {@link RecordReader}s for reading {@link KeyValue} files. */
+public class KeyValueFileReaderFactory implements FileReaderFactory<KeyValue> {
+
+    private final FileIO fileIO;
+    private final SchemaManager schemaManager;
+    private final TableSchema schema;
+    protected final RowType keyType;
+    protected final RowType valueType;
+
+    private final FormatReaderMapping.Builder formatReaderMappingBuilder;
+    private final DataFilePathFactory pathFactory;
+    private final long asyncThreshold;
+    private final boolean ignoreCorruptFiles;
+    private final boolean ignoreLostFiles;
+    private final boolean snapshotSequenceOrdering;
+    private final Map<FormatKey, FormatReaderMapping> formatReaderMappings;
+    private final BinaryRow partition;
+    protected final DeletionVector.Factory dvFactory;
+    @Nullable private final ReadBatchSizer readBatchSizer;
+
+    protected KeyValueFileReaderFactory(
+            FileIO fileIO,
+            SchemaManager schemaManager,
+            TableSchema schema,
+            RowType keyType,
+            RowType valueType,
+            FormatReaderMapping.Builder formatReaderMappingBuilder,
+            DataFilePathFactory pathFactory,
+            BinaryRow partition,
+            DeletionVector.Factory dvFactory,
+            CoreOptions coreOptions,
+            @Nullable ReadBatchSizer readBatchSizer) {
+        this.fileIO = fileIO;
+        this.schemaManager = schemaManager;
+        this.schema = schema;
+        this.keyType = keyType;
+        this.valueType = valueType;
+        this.formatReaderMappingBuilder = formatReaderMappingBuilder;
+        this.pathFactory = pathFactory;
+        this.asyncThreshold = coreOptions.fileReaderAsyncThreshold().getBytes();
+        this.ignoreCorruptFiles = coreOptions.scanIgnoreCorruptFile();
+        this.ignoreLostFiles = coreOptions.scanIgnoreLostFile();
+        this.snapshotSequenceOrdering = coreOptions.snapshotSequenceOrdering();
+        this.partition = partition;
+        this.formatReaderMappings = new ConcurrentHashMap<>();
+        this.dvFactory = dvFactory;
+        this.readBatchSizer = readBatchSizer;
+    }
+
+    public TableSchema schema() {
+        return schema;
+    }
+
+    public DataFilePathFactory pathFactory() {
+        return pathFactory;
+    }
+
+    protected TableSchema getDataSchema(DataFileMeta fileMeta) {
+        long schemaId = fileMeta.schemaId();
+        return schemaId == schema.id() ? schema : schemaManager.schema(schemaId);
+    }
+
+    protected BinaryRow getLogicalPartition() {
+        return partition;
+    }
+
+    @Override
+    public RecordReader<KeyValue> createRecordReader(DataFileMeta file) throws IOException {
+        if (file.fileSize() >= asyncThreshold && file.fileName().endsWith(".orc")) {
+            return new AsyncRecordReader<>(() -> createRecordReader(file, false, 2));
+        }
+        return createRecordReader(file, true, null);
+    }
+
+    protected FileRecordReader<KeyValue> createRecordReader(
+            DataFileMeta file,
+            FileRecordReader<InternalRow> fileRecordReader,
+            boolean overrideSequenceWithSnapshotId)
+            throws IOException {
+        Optional<DeletionVector> deletionVector = dvFactory.create(file.fileName());
+        if (deletionVector.isPresent() && !deletionVector.get().isEmpty()) {
+            fileRecordReader =
+                    new ApplyDeletionVectorReader(fileRecordReader, deletionVector.get());
+        }
+
+        return new KeyValueDataFileRecordReader(
+                fileRecordReader,
+                keyType,
+                valueType,
+                file.level(),
+                overrideSequenceWithSnapshotId,
+                file.minSequenceNumber());
+    }
+
+    private FileRecordReader<KeyValue> createRecordReader(
+            DataFileMeta file, boolean reuseFormat, @Nullable Integer orcPoolSize)
+            throws IOException {
+        String formatIdentifier = DataFilePathFactory.formatIdentifier(file.fileName());
+        long schemaId = file.schemaId();
+
+        Supplier<FormatReaderMapping> formatSupplier =
+                () ->
+                        formatReaderMappingBuilder.build(
+                                formatIdentifier, schema, getDataSchema(file));
+
+        FormatReaderMapping formatReaderMapping =
+                reuseFormat
+                        ? formatReaderMappings.computeIfAbsent(
+                                new FormatKey(schemaId, formatIdentifier),
+                                key -> formatSupplier.get())
+                        : formatSupplier.get();
+        Path filePath = pathFactory.toPath(file);
+
+        long fileSize = file.fileSize();
+        FileRecordReader<InternalRow> fileRecordReader =
+                new DataFileRecordReader(
+                        schema.logicalRowType(),
+                        formatReaderMapping.getReaderFactory(),
+                        orcPoolSize == null
+                                ? new FormatReaderContext(
+                                        fileIO, filePath, fileSize, null, readBatchSizer)
+                                : new OrcFormatReaderContext(
+                                        fileIO, filePath, fileSize, orcPoolSize, readBatchSizer),
+                        ignoreCorruptFiles,
+                        ignoreLostFiles,
+                        formatReaderMapping.getIndexMapping(),
+                        formatReaderMapping.getCastMapping(),
+                        PartitionUtils.create(
+                                formatReaderMapping.getPartitionPair(), getLogicalPartition()),
+                        false,
+                        null,
+                        -1,
+                        Collections.emptyMap());
+
+        // In snapshot-ordering mode, APPEND files carry the commit snapshot id in
+        // minSequenceNumber (stamped at commit time); override per-record sequence with it so
+        // later snapshots win during merge. COMPACT files already carry the snapshot id in their
+        // per-record _SEQUENCE_NUMBER and are left untouched.
+        boolean overrideSequenceWithSnapshotId = false;
+        if (snapshotSequenceOrdering) {
+            Preconditions.checkState(
+                    file.fileSource().isPresent(),
+                    "sequence.snapshot-ordering requires data files with fileSource metadata. "
+                            + "This option is only safe for newly-created tables or empty tables. "
+                            + "Legacy files without fileSource cannot be ordered by commit snapshot id.");
+            overrideSequenceWithSnapshotId = file.fileSource().get() == FileSource.APPEND;
+        }
+
+        return createRecordReader(file, fileRecordReader, overrideSequenceWithSnapshotId);
+    }
+
+    public static Builder builder(
+            FileIO fileIO,
+            SchemaManager schemaManager,
+            TableSchema schema,
+            RowType keyType,
+            RowType valueType,
+            FileFormatDiscover formatDiscover,
+            FileStorePathFactory pathFactory,
+            KeyValueFieldsExtractor extractor,
+            CoreOptions options) {
+        return new Builder(
+                fileIO,
+                schemaManager,
+                schema,
+                keyType,
+                valueType,
+                formatDiscover,
+                pathFactory,
+                extractor,
+                options);
+    }
+
+    /** Builder for {@link KeyValueFileReaderFactory}. */
+    public static class Builder {
+
+        protected final FileIO fileIO;
+        protected final SchemaManager schemaManager;
+        protected final TableSchema schema;
+        protected final RowType keyType;
+        protected final RowType valueType;
+        protected final FileFormatDiscover formatDiscover;
+        protected final FileStorePathFactory pathFactory;
+        protected final KeyValueFieldsExtractor extractor;
+        protected final CoreOptions options;
+
+        protected RowType readKeyType;
+        protected RowType readValueType;
+        @Nullable protected ReadBatchSizer readBatchSizer;
+
+        private Builder(
+                FileIO fileIO,
+                SchemaManager schemaManager,
+                TableSchema schema,
+                RowType keyType,
+                RowType valueType,
+                FileFormatDiscover formatDiscover,
+                FileStorePathFactory pathFactory,
+                KeyValueFieldsExtractor extractor,
+                CoreOptions options) {
+            this.fileIO = fileIO;
+            this.schemaManager = schemaManager;
+            this.schema = schema;
+            this.keyType = keyType;
+            this.valueType = valueType;
+            this.formatDiscover = formatDiscover;
+            this.pathFactory = pathFactory;
+            this.extractor = extractor;
+            this.options = options;
+
+            this.readKeyType = keyType;
+            this.readValueType = valueType;
+        }
+
+        public Builder copyWithoutProjection() {
+            Builder copy =
+                    new Builder(
+                            fileIO,
+                            schemaManager,
+                            schema,
+                            keyType,
+                            valueType,
+                            formatDiscover,
+                            pathFactory,
+                            extractor,
+                            options);
+            copy.readBatchSizer = readBatchSizer;
+            return copy;
+        }
+
+        public Builder copyWithoutValue() {
+            Builder copy =
+                    new Builder(
+                            fileIO,
+                            schemaManager,
+                            schema,
+                            keyType,
+                            RowType.of(),
+                            formatDiscover,
+                            pathFactory,
+                            extractor,
+                            options);
+            copy.readBatchSizer = readBatchSizer;
+            return copy;
+        }
+
+        public Builder withReadKeyType(RowType readKeyType) {
+            this.readKeyType = readKeyType;
+            return this;
+        }
+
+        public Builder withReadValueType(RowType readValueType) {
+            this.readValueType = readValueType;
+            return this;
+        }
+
+        public Builder withReadBatchSizer(ReadBatchSizer sizer) {
+            this.readBatchSizer = sizer;
+            return this;
+        }
+
+        public RowType keyType() {
+            return keyType;
+        }
+
+        public RowType readValueType() {
+            return readValueType;
+        }
+
+        public FileStorePathFactory pathFactory() {
+            return pathFactory;
+        }
+
+        public KeyValueFileReaderFactory build(
+                BinaryRow partition, int bucket, DeletionVector.Factory dvFactory) {
+            return build(partition, bucket, dvFactory, true, Collections.emptyList());
+        }
+
+        /** Builds a reader which preserves every physical row position. */
+        public KeyValueFileReaderFactory buildWithoutDeletionVector(
+                BinaryRow partition, int bucket) {
+            return build(partition, bucket, ignored -> Optional.empty());
+        }
+
+        public KeyValueFileReaderFactory build(
+                BinaryRow partition,
+                int bucket,
+                DeletionVector.Factory dvFactory,
+                boolean projectKeys,
+                @Nullable List<Predicate> filters) {
+            FormatReaderMapping.Builder builder = formatReaderMappingBuilder(projectKeys, filters);
+            return new KeyValueFileReaderFactory(
+                    fileIO,
+                    schemaManager,
+                    schema,
+                    projectKeys ? this.readKeyType : keyType,
+                    readValueType,
+                    builder,
+                    pathFactory.createDataFilePathFactory(partition, bucket),
+                    partition,
+                    dvFactory,
+                    options,
+                    readBatchSizer);
+        }
+
+        protected FormatReaderMapping.Builder formatReaderMappingBuilder(
+                boolean projectKeys, @Nullable List<Predicate> filters) {
+            RowType finalReadKeyType = projectKeys ? this.readKeyType : keyType;
+            List<DataField> readTableFields =
+                    KeyValue.createKeyValueFields(
+                            finalReadKeyType.getFields(), readValueType.getFields());
+            Function<TableSchema, List<DataField>> fieldsExtractor =
+                    schema -> {
+                        List<DataField> dataKeyFields = extractor.keyFields(schema);
+                        List<DataField> dataValueFields = extractor.valueFields(schema);
+                        return KeyValue.createKeyValueFields(dataKeyFields, dataValueFields);
+                    };
+            return new FormatReaderMapping.Builder(
+                    formatDiscover,
+                    readTableFields,
+                    fieldsExtractor,
+                    filters,
+                    null,
+                    null,
+                    options.dataEvolutionNestedFieldEnabled());
+        }
+
+        public FileIO fileIO() {
+            return fileIO;
+        }
+
+        public CoreOptions options() {
+            return options;
+        }
+    }
+}

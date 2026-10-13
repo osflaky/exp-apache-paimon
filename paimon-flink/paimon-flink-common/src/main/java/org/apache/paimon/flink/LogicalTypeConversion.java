@@ -1,0 +1,141 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.types.BlobType;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.VectorType;
+import org.apache.paimon.utils.StringUtils;
+
+import org.apache.flink.table.types.logical.BinaryType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.VarBinaryType;
+
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+
+/** Conversion between {@link LogicalType} and {@link DataType}. */
+public class LogicalTypeConversion {
+
+    public static org.apache.flink.table.types.logical.RowType toLogicalType(RowType dataType) {
+        return (org.apache.flink.table.types.logical.RowType)
+                dataType.accept(DataTypeToLogicalType.INSTANCE);
+    }
+
+    public static LogicalType toLogicalType(DataType dataType) {
+        return dataType.accept(DataTypeToLogicalType.INSTANCE);
+    }
+
+    public static DataType toBlobType(LogicalType logicalType) {
+        return toBlobType(logicalType, true);
+    }
+
+    public static DataType toBlobType(LogicalType logicalType, boolean allowNested) {
+        if (logicalType instanceof org.apache.flink.table.types.logical.ArrayType) {
+            checkArgument(
+                    allowNested,
+                    "ARRAY<BLOB> is only supported by '" + CoreOptions.BLOB_FIELD.key() + "'.");
+            LogicalType elementType =
+                    ((org.apache.flink.table.types.logical.ArrayType) logicalType).getElementType();
+            checkArgument(
+                    isBinaryType(elementType),
+                    "Expected BinaryType, VarBinaryType or ArrayType with BinaryType or "
+                            + "VarBinaryType element, but got: "
+                            + logicalType);
+            return new org.apache.paimon.types.ArrayType(
+                    logicalType.isNullable(), new BlobType(elementType.isNullable()));
+        }
+        if (logicalType instanceof org.apache.flink.table.types.logical.MapType) {
+            checkArgument(
+                    allowNested,
+                    "MAP<X, BLOB> is only supported by '" + CoreOptions.BLOB_FIELD.key() + "'.");
+            org.apache.flink.table.types.logical.MapType mapType =
+                    (org.apache.flink.table.types.logical.MapType) logicalType;
+            LogicalType valueType = mapType.getValueType();
+            checkArgument(
+                    isBinaryType(valueType),
+                    "The value type of a MAP<X, BLOB> field must be BinaryType or "
+                            + "VarBinaryType, but got: "
+                            + logicalType);
+            return new org.apache.paimon.types.MapType(
+                    logicalType.isNullable(),
+                    toDataType(mapType.getKeyType()),
+                    new BlobType(valueType.isNullable()));
+        }
+        checkArgument(
+                isBinaryType(logicalType),
+                "Expected BinaryType, VarBinaryType, ArrayType with binary element, or "
+                        + "MapType with binary value, but got: "
+                        + logicalType);
+        return new BlobType(logicalType.isNullable());
+    }
+
+    private static boolean isBinaryType(LogicalType logicalType) {
+        return logicalType instanceof BinaryType || logicalType instanceof VarBinaryType;
+    }
+
+    public static VectorType toVectorType(
+            String fieldName,
+            org.apache.flink.table.types.logical.LogicalType logicalType,
+            Map<String, String> options) {
+        checkArgument(
+                logicalType instanceof org.apache.flink.table.types.logical.ArrayType,
+                "Only array type can be converted to Paimon vector type.");
+        org.apache.flink.table.types.logical.LogicalType elementType =
+                ((org.apache.flink.table.types.logical.ArrayType) logicalType).getElementType();
+
+        String dimKey = String.format("field.%s.vector-dim", fieldName);
+        checkArgument(
+                options.containsKey(dimKey),
+                "When setting '%s', you must also set '%s'.",
+                CoreOptions.VECTOR_FIELD.key(),
+                dimKey);
+        String vectorDim = options.get(dimKey);
+        checkArgument(
+                !StringUtils.isNullOrWhitespaceOnly(vectorDim),
+                "Expected an integer for '%s', but got empty value.",
+                dimKey);
+
+        try {
+            int dim = Integer.parseInt(vectorDim.trim());
+            return DataTypes.VECTOR(dim, toDataType(elementType));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                    String.format("Expected an integer for '%s', but got: %s.", dimKey, vectorDim));
+        }
+    }
+
+    public static RowType toDataType(org.apache.flink.table.types.logical.RowType logicalType) {
+        return (RowType) toDataType(logicalType, new AtomicInteger(-1));
+    }
+
+    public static DataType toDataType(LogicalType logicalType) {
+        return toDataType(logicalType, new AtomicInteger(-1));
+    }
+
+    public static DataType toDataType(
+            LogicalType logicalType, AtomicInteger currentHighestFieldId) {
+        return logicalType.accept(new LogicalTypeToDataType(currentHighestFieldId));
+    }
+}

@@ -1,0 +1,479 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.source;
+
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.flink.FlinkConnectorOptions;
+import org.apache.paimon.flink.PaimonDataStreamScanProvider;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.schema.FileSystemSchemaManager;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
+import org.apache.paimon.table.sink.InnerTableWrite;
+import org.apache.paimon.table.sink.TableCommitImpl;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.system.AuditLogTable;
+import org.apache.paimon.table.system.ReadOptimizedTable;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.SerializableFunction;
+
+import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
+
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.ExecutionOptions;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.catalog.ObjectIdentifier;
+import org.apache.flink.table.connector.source.DynamicTableSource;
+import org.apache.flink.table.connector.source.LookupTableSource;
+import org.apache.flink.table.connector.source.ScanTableSource;
+import org.apache.flink.table.connector.source.abilities.SupportsRowLevelModificationScan.RowLevelModificationType;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.apache.paimon.options.OptionsUtils.PAIMON_PREFIX;
+import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
+import static org.assertj.core.api.AssertionsForClassTypes.assertThatThrownBy;
+
+/** Tests for {@link DataTableSource}. */
+class DataTableSourceTest {
+
+    @TempDir java.nio.file.Path path;
+
+    @Test
+    void testInferScanParallelism() throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put("bucket", "1");
+        options.put("bucket-key", "a");
+        FileStoreTable fileStoreTable = createTable(options);
+        writeData(fileStoreTable);
+
+        DataTableSource tableSource =
+                new DataTableSource(
+                        ObjectIdentifier.of("cat", "db", "table"), fileStoreTable, true, null);
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+        assertThat(runtimeProvider.getParallelism()).isEmpty();
+        StreamExecutionEnvironment sEnv1 = StreamExecutionEnvironment.createLocalEnvironment();
+        sEnv1.setParallelism(-1);
+        DataStream<RowData> sourceStream1 =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), sEnv1);
+        assertThat(sourceStream1.getParallelism()).isEqualTo(1);
+
+        StreamExecutionEnvironment sEnv2 =
+                StreamExecutionEnvironment.createLocalEnvironment(
+                        Configuration.fromMap(
+                                Collections.singletonMap(
+                                        String.format(
+                                                "%s%s",
+                                                PAIMON_PREFIX,
+                                                FlinkConnectorOptions.INFER_SCAN_PARALLELISM.key()),
+                                        "false")));
+        DataStream<RowData> sourceStream2 =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), sEnv2);
+        // The default parallelism is not 1
+        assertThat(sourceStream2.getParallelism()).isNotEqualTo(1);
+        assertThat(sourceStream2.getParallelism()).isEqualTo(sEnv2.getParallelism());
+    }
+
+    @Test
+    void testConfiguredScanParallelism() throws Exception {
+        FileStoreTable fileStoreTable =
+                createTable(
+                        ImmutableMap.of(
+                                "bucket", "1",
+                                "bucket-key", "a",
+                                "scan.parallelism", "3"));
+
+        DataTableSource tableSource =
+                new DataTableSource(
+                        ObjectIdentifier.of("cat", "db", "table"), fileStoreTable, true, null);
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+
+        assertThat(runtimeProvider.getParallelism()).contains(3);
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
+        env.setParallelism(7);
+        DataStream<RowData> sourceStream =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), env);
+        assertThat(sourceStream.getParallelism()).isEqualTo(3);
+    }
+
+    @Test
+    void testEmptyRowLevelModificationScanParallelism() throws Exception {
+        FileStoreTable fileStoreTable =
+                createTable(
+                        ImmutableMap.of(
+                                "bucket", "-1",
+                                "row-tracking.enabled", "true",
+                                "data-evolution.enabled", "true"));
+
+        DataTableSource tableSource =
+                new DataTableSource(
+                        ObjectIdentifier.of("cat", "db", "table"), fileStoreTable, true, null);
+        tableSource.applyRowLevelModificationScan(RowLevelModificationType.DELETE, null);
+
+        assertThat(runtimeProvider(tableSource).getParallelism()).contains(1);
+    }
+
+    @Test
+    void testInferPostponeMergeParallelism() throws Exception {
+        FileStoreTable fileStoreTable = createPostponeTable(false);
+        writePostponeData(fileStoreTable);
+
+        DataTableSource tableSource =
+                new DataTableSource(
+                        ObjectIdentifier.of("cat", "db", "table"), fileStoreTable, false, null);
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
+        env.setParallelism(-1);
+
+        DataStream<RowData> sourceStream =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), env);
+
+        assertThat(sourceStream.getParallelism()).isEqualTo(3);
+    }
+
+    @Test
+    void testPostponeMergeRejectsLookupAndDynamicFiltering() throws Exception {
+        FileStoreTable fileStoreTable = createPostponeTable(true);
+        DataTableSource tableSource =
+                new DataTableSource(
+                        ObjectIdentifier.of("cat", "db", "table"), fileStoreTable, false, null);
+
+        assertThat(tableSource.listAcceptedFilterFields()).isEqualTo(Collections.emptyList());
+        assertThatThrownBy(() -> tableSource.applyDynamicFiltering(Collections.singletonList("pt")))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("postpone merge-on-read");
+        assertThatThrownBy(() -> tableSource.getLookupRuntimeProvider(lookupContext()))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("not supported for lookup reads");
+    }
+
+    @Test
+    public void testInferStreamParallelism() throws Exception {
+        FileStoreTable fileStoreTable = createTable(ImmutableMap.of("bucket", "-1"));
+
+        DataTableSource tableSource =
+                new DataTableSource(
+                        ObjectIdentifier.of("cat", "db", "table"), fileStoreTable, true, null);
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+
+        StreamExecutionEnvironment sEnv1 = StreamExecutionEnvironment.createLocalEnvironment();
+        DataStream<RowData> sourceStream1 =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), sEnv1);
+        assertThat(sourceStream1.getParallelism()).isEqualTo(sEnv1.getParallelism());
+    }
+
+    @Test
+    public void testSystemTableParallelism() throws Exception {
+        FileStoreTable fileStoreTable =
+                createTable(
+                        ImmutableMap.of("bucket", "1", "bucket-key", "a", "scan.parallelism", "3"));
+
+        ReadOptimizedTable ro = new ReadOptimizedTable(fileStoreTable);
+
+        SystemTableSource tableSource =
+                new SystemTableSource(ro, false, ObjectIdentifier.of("cat", "db", "table"));
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+
+        Configuration configuration = new Configuration();
+        configuration.set(ExecutionOptions.RUNTIME_MODE, RuntimeExecutionMode.BATCH);
+        StreamExecutionEnvironment sEnv1 = StreamExecutionEnvironment.createLocalEnvironment();
+        DataStream<RowData> sourceStream1 =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), sEnv1);
+        assertThat(runtimeProvider.getParallelism()).contains(3);
+        assertThat(sourceStream1.getParallelism()).isEqualTo(3);
+    }
+
+    @Test
+    void testBoundedSystemTableUsesFileSizeWeightModeAfterCopy() throws Exception {
+        FileStoreTable fileStoreTable =
+                createTable(
+                        ImmutableMap.of(
+                                "bucket",
+                                "1",
+                                "bucket-key",
+                                "a",
+                                FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_ASSIGN_MODE.key(),
+                                FlinkConnectorOptions.SplitAssignMode.FAIR.toString(),
+                                FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_WEIGHT_MODE.key(),
+                                FlinkConnectorOptions.SplitWeightMode.FILE_SIZE.toString()));
+        SystemTableSource tableSource =
+                new SystemTableSource(
+                                new ReadOptimizedTable(fileStoreTable),
+                                false,
+                                ObjectIdentifier.of("cat", "db", "table$ro"))
+                        .copy();
+
+        StaticFileStoreSource source = staticSource(tableSource);
+        java.lang.reflect.Field weightFuncField =
+                StaticFileStoreSource.class.getDeclaredField("splitWeightFunc");
+        weightFuncField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        SerializableFunction<FileStoreSourceSplit, Long> weightFunc =
+                (SerializableFunction<FileStoreSourceSplit, Long>) weightFuncField.get(source);
+        FileStoreSourceSplit split =
+                new FileStoreSourceSplit(
+                        "split-1",
+                        DataSplit.builder()
+                                .withSnapshot(1L)
+                                .withPartition(org.apache.paimon.data.BinaryRow.EMPTY_ROW)
+                                .withBucket(0)
+                                .withBucketPath("bucket-0")
+                                .withDataFiles(
+                                        Collections.singletonList(
+                                                DataFileMeta.forAppend(
+                                                        "file-1",
+                                                        35L,
+                                                        1000L,
+                                                        null,
+                                                        0L,
+                                                        0L,
+                                                        0L,
+                                                        Collections.emptyList(),
+                                                        null,
+                                                        null,
+                                                        null,
+                                                        null,
+                                                        null,
+                                                        null)))
+                                .build());
+
+        assertThat(weightFunc.apply(split)).isEqualTo(35L);
+    }
+
+    @Test
+    void testBoundedSystemTableRejectsFileSizeWithPreemptiveMode() throws Exception {
+        FileStoreTable fileStoreTable =
+                createTable(
+                        ImmutableMap.of(
+                                "bucket",
+                                "1",
+                                "bucket-key",
+                                "a",
+                                FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_ASSIGN_MODE.key(),
+                                FlinkConnectorOptions.SplitAssignMode.PREEMPTIVE.toString(),
+                                FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_WEIGHT_MODE.key(),
+                                FlinkConnectorOptions.SplitWeightMode.FILE_SIZE.toString()));
+
+        assertThatThrownBy(
+                        () ->
+                                new SystemTableSource(
+                                        new ReadOptimizedTable(fileStoreTable),
+                                        false,
+                                        ObjectIdentifier.of("cat", "db", "table$ro")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_WEIGHT_MODE.key())
+                .hasMessageContaining(
+                        FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_ASSIGN_MODE.key());
+    }
+
+    @Test
+    public void testSystemTableSourceUnorderedForBucketUnawareTable() throws Exception {
+        // bucket = -1 (BUCKET_UNAWARE append-only table) wrapped in a system table should produce
+        // unordered = true so splits are distributed via FIFOSplitAssigner across all tasks
+        FileStoreTable bucketUnawareTable = createTable(ImmutableMap.of("bucket", "-1"));
+        AuditLogTable auditLogTable = new AuditLogTable(bucketUnawareTable);
+
+        SystemTableSource tableSource =
+                new SystemTableSource(
+                        auditLogTable, true, ObjectIdentifier.of("cat", "db", "table$audit_log"));
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
+        DataStream<RowData> sourceStream =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), env);
+
+        // Retrieve the source from the transformation and verify unordered = true
+        ContinuousFileStoreSource source =
+                (ContinuousFileStoreSource)
+                        ((org.apache.flink.streaming.api.transformations.SourceTransformation<
+                                                ?, ?, ?>)
+                                        sourceStream.getTransformation())
+                                .getSource();
+        java.lang.reflect.Field unorderedField =
+                ContinuousFileStoreSource.class.getDeclaredField("unordered");
+        unorderedField.setAccessible(true);
+        assertThat((boolean) unorderedField.get(source)).isTrue();
+    }
+
+    @Test
+    public void testSystemTableSourceOrderedForHashFixedTable() throws Exception {
+        // bucket > 0 (HASH_FIXED) with bucket-append-ordered = true should produce unordered =
+        // false
+        FileStoreTable hashFixedTable =
+                createTable(ImmutableMap.of("bucket", "4", "bucket-key", "a"));
+        ReadOptimizedTable roTable = new ReadOptimizedTable(hashFixedTable);
+
+        SystemTableSource tableSource =
+                new SystemTableSource(roTable, true, ObjectIdentifier.of("cat", "db", "table$ro"));
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
+        DataStream<RowData> sourceStream =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), env);
+
+        ContinuousFileStoreSource source =
+                (ContinuousFileStoreSource)
+                        ((org.apache.flink.streaming.api.transformations.SourceTransformation<
+                                                ?, ?, ?>)
+                                        sourceStream.getTransformation())
+                                .getSource();
+        java.lang.reflect.Field unorderedField =
+                ContinuousFileStoreSource.class.getDeclaredField("unordered");
+        unorderedField.setAccessible(true);
+        assertThat((boolean) unorderedField.get(source)).isFalse();
+    }
+
+    private PaimonDataStreamScanProvider runtimeProvider(FlinkTableSource tableSource) {
+        return (PaimonDataStreamScanProvider)
+                tableSource.getScanRuntimeProvider(
+                        new ScanTableSource.ScanContext() {
+                            @Override
+                            public <T> TypeInformation<T> createTypeInformation(DataType dataType) {
+                                throw new UnsupportedOperationException();
+                            }
+
+                            @Override
+                            public <T> TypeInformation<T> createTypeInformation(
+                                    LogicalType logicalType) {
+                                throw new UnsupportedOperationException();
+                            }
+
+                            @Override
+                            public DynamicTableSource.DataStructureConverter
+                                    createDataStructureConverter(DataType dataType) {
+                                throw new UnsupportedOperationException();
+                            }
+                        });
+    }
+
+    private StaticFileStoreSource staticSource(SystemTableSource tableSource) {
+        PaimonDataStreamScanProvider runtimeProvider = runtimeProvider(tableSource);
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.createLocalEnvironment();
+        DataStream<RowData> sourceStream =
+                runtimeProvider.produceDataStream(s -> Optional.empty(), env);
+        return (StaticFileStoreSource)
+                ((org.apache.flink.streaming.api.transformations.SourceTransformation<?, ?, ?>)
+                                sourceStream.getTransformation())
+                        .getSource();
+    }
+
+    private FileStoreTable createTable(Map<String, String> options) throws Exception {
+        FileIO fileIO = LocalFileIO.create();
+        Path tablePath = new Path(path.toString());
+        SchemaManager schemaManager = new FileSystemSchemaManager(fileIO, tablePath);
+        TableSchema tableSchema =
+                schemaManager.createTable(
+                        Schema.newBuilder()
+                                .column("a", DataTypes.INT())
+                                .column("b", DataTypes.BIGINT())
+                                .options(options)
+                                .build());
+        return FileStoreTableFactory.create(fileIO, tablePath, tableSchema);
+    }
+
+    private FileStoreTable createPostponeTable(boolean partitioned) throws Exception {
+        FileIO fileIO = LocalFileIO.create();
+        Path tablePath = new Path(path.toString());
+        SchemaManager schemaManager = new FileSystemSchemaManager(fileIO, tablePath);
+        Schema.Builder schemaBuilder =
+                Schema.newBuilder()
+                        .column("pt", DataTypes.INT())
+                        .column("a", DataTypes.INT())
+                        .column("b", DataTypes.BIGINT())
+                        .primaryKey("pt", "a")
+                        .option("bucket", "-2")
+                        .option("postpone.merge-on-read", "true");
+        if (partitioned) {
+            schemaBuilder.partitionKeys("pt");
+        } else {
+            schemaBuilder
+                    .option("source.split.target-size", "1 B")
+                    .option("scan.infer-parallelism.max", "3");
+        }
+        TableSchema tableSchema = schemaManager.createTable(schemaBuilder.build());
+        return FileStoreTableFactory.create(fileIO, tablePath, tableSchema);
+    }
+
+    private void writeData(FileStoreTable table) throws Exception {
+        InnerTableWrite writer = table.newWrite("test");
+        TableCommitImpl commit = table.newCommit("test");
+        writer.write(GenericRow.of(1, 2L));
+        commit.commit(writer.prepareCommit());
+        commit.close();
+        writer.close();
+    }
+
+    private void writePostponeData(FileStoreTable table) throws Exception {
+        InnerTableWrite writer = table.newWrite("test");
+        TableCommitImpl commit = table.newCommit("test");
+        writer.write(GenericRow.of(1, 1, 1L));
+        writer.write(GenericRow.of(1, 2, 2L));
+        writer.write(GenericRow.of(1, 3, 3L));
+        commit.commit(writer.prepareCommit());
+        commit.close();
+        writer.close();
+    }
+
+    private LookupTableSource.LookupContext lookupContext() {
+        return new LookupTableSource.LookupContext() {
+            @Override
+            public int[][] getKeys() {
+                return new int[][] {{1}};
+            }
+
+            @Override
+            public <T> TypeInformation<T> createTypeInformation(DataType dataType) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public <T> TypeInformation<T> createTypeInformation(LogicalType logicalType) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public DynamicTableSource.DataStructureConverter createDataStructureConverter(
+                    DataType dataType) {
+                throw new UnsupportedOperationException();
+            }
+
+            public boolean preferCustomShuffle() {
+                return false;
+            }
+        };
+    }
+}

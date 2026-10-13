@@ -1,0 +1,1086 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import unittest
+import uuid
+from dataclasses import replace
+from datetime import datetime
+from unittest.mock import MagicMock, Mock, patch
+
+from pypaimon.common.options.core_options import CoreOptions
+from pypaimon.common.options.options import Options
+from pypaimon.manifest.schema.data_file_meta import DataFileMeta
+from pypaimon.manifest.schema.manifest_entry import ManifestEntry
+from pypaimon.manifest.schema.manifest_file_meta import ManifestFileMeta
+from pypaimon.manifest.schema.simple_stats import SimpleStats
+from pypaimon.snapshot.snapshot_commit import PartitionStatistics
+from pypaimon.table.row.binary_row import BinaryRow
+from pypaimon.table.row.generic_row import GenericRow, GenericRowSerializer
+from pypaimon.write.commit.row_id_conflict_rewriter import RowIdRewriteResult
+from pypaimon.write.commit_message import CommitMessage
+from pypaimon.write.file_store_commit import (
+    CommitFailRetryResult,
+    FileStoreCommit,
+    RollbackRetryResult,
+    RewriteResult,
+    _abort_commit_messages,
+    _reject_compact_increment,
+    _row_id_check_from_messages,
+)
+
+
+class TestRowIdCheckFromMessages(unittest.TestCase):
+
+    def test_minimum_baseline_and_invalid_messages(self):
+        tagged = CommitMessage((), 0, [], check_from_snapshot=7)
+        self.assertEqual(_row_id_check_from_messages([tagged, tagged]), 7)
+        self.assertIsNone(_row_id_check_from_messages([CommitMessage((), 0, [])]))
+
+        newer = CommitMessage((), 0, [], check_from_snapshot=8)
+        for messages in ([tagged, newer], [newer, tagged]):
+            self.assertEqual(_row_id_check_from_messages(messages), 7)
+        with self.assertRaisesRegex(ValueError, 'Invalid row-id check snapshot'):
+            _row_id_check_from_messages([
+                CommitMessage((), 0, [], check_from_snapshot=-1)])
+        with self.assertRaisesRegex(ValueError, 'missing its check-from snapshot'):
+            _row_id_check_from_messages([
+                tagged, CommitMessage((), 0, [Mock(first_row_id=1)])])
+
+    def test_compaction_lists_are_not_flattened_into_append(self):
+        message = CommitMessage(
+            (), 0, [], compact_before=[Mock(file_name='before')],
+            compact_after=[Mock(file_name='after')],
+            compact_changelog_files=[Mock(file_name='changelog')])
+        with self.assertRaisesRegex(NotImplementedError, 'separate COMPACT snapshot'):
+            _reject_compact_increment([message])
+        _reject_compact_increment([CommitMessage((), 0, [])])
+
+    def test_overwrite_validates_message_baseline(self):
+        commit = FileStoreCommit.__new__(FileStoreCommit)
+        with self.assertRaisesRegex(ValueError, 'Invalid row-id check snapshot'):
+            commit.overwrite(
+                None, [CommitMessage((), 0, [], check_from_snapshot=-1)], 1)
+
+
+class TestAbortCommitMessages(unittest.TestCase):
+
+    def test_reconstructs_local_path_after_wire_decode(self):
+        table = Mock()
+        table.path_factory.return_value.bucket_path.return_value = '/table/p=1/bucket-0'
+        file = Mock(file_name='data.parquet', external_path=None, file_path=None)
+        message = CommitMessage((1,), 0, [file])
+        _abort_commit_messages(table, [message])
+        table.file_io.delete_quietly.assert_called_once_with(
+            '/table/p=1/bucket-0/data.parquet')
+
+    def test_index_path_failure_does_not_escape_abort(self):
+        table = Mock()
+        table.path_factory.side_effect = RuntimeError("path lookup failed")
+        index_file = Mock(file_name="index-file", external_path=None)
+        message = Mock(
+            new_files=[],
+            changelog_files=[],
+            index_adds=[Mock(index_file=index_file)],
+            compact_after=[],
+            compact_changelog_files=[],
+            compact_index_adds=[],
+        )
+
+        with self.assertLogs(
+                'pypaimon.write.file_store_commit', level='WARNING'):
+            _abort_commit_messages(table, [message])
+
+
+class TestFileStoreCommitRowTracking(unittest.TestCase):
+
+    def setUp(self):
+        self.mock_table = Mock()
+        self.mock_table.partition_keys = ['dt', 'region']
+        self.mock_table.current_branch.return_value = 'main'
+        self.mock_table.table_path = '/test/table/path'
+        self.mock_table.file_io = Mock()
+        self.mock_table.options.manifest_target_size.return_value = 8 * 1024 * 1024
+        self.mock_snapshot_commit = Mock()
+
+    def _create_file_store_commit(self):
+        with patch('pypaimon.write.file_store_commit.ManifestFileManager'), \
+                patch('pypaimon.write.file_store_commit.ManifestListManager'):
+            return FileStoreCommit(
+                snapshot_commit=self.mock_snapshot_commit,
+                table=self.mock_table,
+                commit_user='test_user'
+            )
+
+    @staticmethod
+    def _manifest_meta(name):
+        row = GenericRowSerializer.to_bytes(GenericRow([], []))
+        return ManifestFileMeta(
+            file_name=name,
+            file_size=10,
+            num_added_files=1,
+            num_deleted_files=0,
+            partition_stats=SimpleStats(
+                BinaryRow(row, []), BinaryRow(row, []), []),
+            schema_id=0,
+        )
+
+    @staticmethod
+    def _data_file(name, row_count):
+        return DataFileMeta.create(
+            file_name=name,
+            file_size=10,
+            row_count=row_count,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=0,
+            max_sequence_number=0,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            file_source=0,
+        )
+
+    @classmethod
+    def _append_entry(cls, partition, name, row_count):
+        return ManifestEntry(
+            kind=0,
+            partition=GenericRow(list(partition), None),
+            bucket=0,
+            total_buckets=1,
+            file=cls._data_file(name, row_count),
+        )
+
+    def test_groups_files_by_partition_before_assigning_row_ids(self):
+        file_store_commit = self._create_file_store_commit()
+        entries = [
+            self._append_entry(('dt=1',), 'a-1.parquet', 2),
+            self._append_entry(('dt=2',), 'b-1.parquet', 3),
+            self._append_entry(('dt=1',), 'a-2.parquet', 4),
+        ]
+
+        grouped = file_store_commit._group_commit_entries_by_partition(entries)
+        assigned, next_row_id = file_store_commit._assign_row_tracking_meta(
+            10, grouped)
+
+        self.assertEqual(19, next_row_id)
+        self.assertEqual(
+            [
+                ('a-1.parquet', 10),
+                ('a-2.parquet', 12),
+                ('b-1.parquet', 16),
+            ],
+            [(entry.file.file_name, entry.file.first_row_id)
+             for entry in assigned],
+        )
+
+    def test_partition_group_on_commit_option_defaults_to_true(self):
+        options = CoreOptions(Options({}))
+
+        self.assertTrue(options.row_tracking_partition_group_on_commit())
+        self.assertFalse(
+            CoreOptions(Options({
+                "row-tracking.partition-group-on-commit": "false",
+            })).row_tracking_partition_group_on_commit())
+
+    def test_keeps_order_when_partition_grouping_disabled(self):
+        file_store_commit = self._create_file_store_commit()
+        entries = [
+            self._append_entry(('dt=1',), 'a-1.parquet', 2),
+            self._append_entry(('dt=2',), 'b-1.parquet', 3),
+            self._append_entry(('dt=1',), 'a-2.parquet', 4),
+        ]
+
+        assigned, next_row_id = file_store_commit._assign_row_tracking_meta(
+            10, entries)
+
+        self.assertEqual(19, next_row_id)
+        self.assertEqual(
+            [
+                ('a-1.parquet', 10),
+                ('b-1.parquet', 12),
+                ('a-2.parquet', 15),
+            ],
+            [(entry.file.file_name, entry.file.first_row_id)
+             for entry in assigned],
+        )
+
+    def _commit_row_tracking_entries(self, options):
+        file_store_commit = self._create_file_store_commit()
+        self.mock_table.identifier = 'default.test_table'
+        self.mock_table.table_schema = Mock()
+        self.mock_table.table_schema.id = 7
+        self.mock_table.options = CoreOptions(Options(options))
+
+        snapshot_commit = MagicMock()
+        snapshot_commit.__enter__.return_value = snapshot_commit
+        snapshot_commit.__exit__.return_value = False
+        snapshot_commit.commit.return_value = True
+        file_store_commit.snapshot_commit = snapshot_commit
+        file_store_commit.manifest_list_manager.read_all.return_value = []
+        file_store_commit._generate_partition_statistics = Mock(
+            return_value=[])
+
+        written_entries = []
+
+        def capture_entries(entries, manifest_file_name):
+            del manifest_file_name
+            written_entries.extend(entries)
+            return [self._manifest_meta('delta')]
+
+        file_store_commit._write_manifest_files = Mock(
+            side_effect=capture_entries)
+
+        entries = [
+            self._append_entry(('dt=1',), 'a-1.parquet', 2),
+            self._append_entry(('dt=2',), 'b-1.parquet', 3),
+            self._append_entry(('dt=1',), 'a-2.parquet', 4),
+        ]
+
+        file_store_commit._try_commit_once(
+            retry_result=None,
+            commit_kind="APPEND",
+            commit_entries=entries,
+            changelog_entries=[],
+            commit_identifier=11,
+            latest_snapshot=None,
+        )
+
+        committed_snapshot = snapshot_commit.commit.call_args[0][1]
+        return committed_snapshot, written_entries
+
+    def test_commit_applies_default_partition_grouping_before_row_id(self):
+        committed_snapshot, written_entries = (
+            self._commit_row_tracking_entries({
+                "row-tracking.enabled": "true",
+            }))
+
+        self.assertEqual(9, committed_snapshot.next_row_id)
+        self.assertEqual(
+            [
+                ('a-1.parquet', 0),
+                ('a-2.parquet', 2),
+                ('b-1.parquet', 6),
+            ],
+            [(entry.file.file_name, entry.file.first_row_id)
+             for entry in written_entries],
+        )
+
+    def test_commit_respects_disabled_partition_grouping(self):
+        committed_snapshot, written_entries = (
+            self._commit_row_tracking_entries({
+                "row-tracking.enabled": "true",
+                "row-tracking.partition-group-on-commit": "false",
+            }))
+
+        self.assertEqual(9, committed_snapshot.next_row_id)
+        self.assertEqual(
+            [
+                ('a-1.parquet', 0),
+                ('b-1.parquet', 2),
+                ('a-2.parquet', 5),
+            ],
+            [(entry.file.file_name, entry.file.first_row_id)
+             for entry in written_entries],
+        )
+
+
+@patch('pypaimon.write.file_store_commit.ManifestFileManager')
+@patch('pypaimon.write.file_store_commit.ManifestListManager')
+class TestFileStoreCommit(unittest.TestCase):
+    """Test cases for FileStoreCommit class."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        # Mock table with required attributes
+        self.mock_table = Mock()
+        self.mock_table.partition_keys = ['dt', 'region']
+        self.mock_table.current_branch.return_value = 'main'
+        self.mock_table.table_path = '/test/table/path'
+        self.mock_table.file_io = Mock()
+        self.mock_table.options.manifest_target_size.return_value = 8 * 1024 * 1024
+
+        # Mock snapshot commit
+        self.mock_snapshot_commit = Mock()
+
+    def _create_file_store_commit(self):
+        """Helper method to create FileStoreCommit instance."""
+        return FileStoreCommit(
+            snapshot_commit=self.mock_snapshot_commit,
+            table=self.mock_table,
+            commit_user='test_user'
+        )
+
+    @staticmethod
+    def _manifest_meta(name):
+        row = GenericRowSerializer.to_bytes(GenericRow([], []))
+        return ManifestFileMeta(
+            file_name=name,
+            file_size=10,
+            num_added_files=1,
+            num_deleted_files=0,
+            partition_stats=SimpleStats(
+                BinaryRow(row, []), BinaryRow(row, []), []),
+            schema_id=0,
+        )
+
+    def test_conflict_rollback_retry_skips_history_and_rescans_base(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        file_store_commit = self._create_file_store_commit()
+        conflict = RuntimeError("conflicting compaction")
+        read_all = Mock(return_value=[])
+        file_store_commit.commit_scanner.read_all_entries_from_changed_partitions = read_all
+        file_store_commit.conflict_detection.check_conflicts = Mock(
+            return_value=conflict
+        )
+        file_store_commit.rollback = Mock()
+        file_store_commit.rollback.try_to_rollback.return_value = True
+
+        result = file_store_commit._try_commit_once(
+            retry_result=None,
+            commit_kind="APPEND",
+            commit_entries=[Mock()],
+            changelog_entries=[],
+            commit_identifier=11,
+            latest_snapshot=Mock(id=3),
+            detect_conflicts=True,
+            allow_rollback=True,
+        )
+
+        self.assertIsInstance(result, RollbackRetryResult)
+        self.assertIs(result.exception, conflict)
+
+        file_store_commit.snapshot_manager.get_snapshot_by_id.side_effect = (
+            AssertionError("rollback retry must not scan snapshot history")
+        )
+        file_store_commit.commit_scanner.read_incremental_changes = Mock(
+            side_effect=AssertionError(
+                "rollback retry must not reuse the previous conflict base"
+            )
+        )
+        read_all.reset_mock()
+        file_store_commit.conflict_detection.check_conflicts.return_value = (
+            RuntimeError("conflict after rollback retry")
+        )
+
+        with self.assertRaisesRegex(
+                RuntimeError, "conflict after rollback retry"):
+            file_store_commit._try_commit_once(
+                retry_result=result,
+                commit_kind="APPEND",
+                commit_entries=[Mock()],
+                changelog_entries=[],
+                commit_identifier=11,
+                latest_snapshot=Mock(id=2),
+                detect_conflicts=True,
+            )
+
+        file_store_commit.snapshot_manager.get_snapshot_by_id.assert_not_called()
+        file_store_commit.commit_scanner.read_incremental_changes.assert_not_called()
+        read_all.assert_called_once()
+
+    def test_commit_fail_retry_missing_snapshot_still_fails_closed(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        file_store_commit = self._create_file_store_commit()
+        file_store_commit.snapshot_manager.get_snapshot_by_id.return_value = None
+
+        with self.assertRaisesRegex(
+                RuntimeError, "snapshot 1 cannot be found"):
+            file_store_commit._is_duplicate_commit(
+                CommitFailRetryResult(None),
+                Mock(id=3),
+                11,
+                "APPEND",
+            )
+
+        file_store_commit.snapshot_manager.get_snapshot_by_id.assert_called_once_with(1)
+
+    def _run_manifest_commit_attempt(self, commit_side_effect=None,
+                                     commit_result=None, retry_result=None,
+                                     existing_manifests=None,
+                                     latest_watermark=None):
+        file_store_commit = self._create_file_store_commit()
+        self.mock_table.identifier = 'default.test_table'
+        self.mock_table.table_schema.id = 7
+        self.mock_table.options.row_tracking_enabled.return_value = False
+
+        snapshot_commit = MagicMock()
+        snapshot_commit.__enter__.return_value = snapshot_commit
+        snapshot_commit.__exit__.return_value = False
+        snapshot_commit.commit.side_effect = commit_side_effect
+        snapshot_commit.commit.return_value = commit_result
+        file_store_commit.snapshot_commit = snapshot_commit
+
+        before = self._manifest_meta('before')
+        existing_manifests = (
+            [before] if existing_manifests is None
+            else existing_manifests)
+        delta = self._manifest_meta('delta')
+        file_store_commit._write_manifest_files = Mock(
+            return_value=[delta])
+        file_store_commit._generate_partition_statistics = Mock(
+            return_value=[])
+        file_store_commit.manifest_list_manager.read_all.return_value = (
+            existing_manifests)
+
+        latest_snapshot = Mock(
+            id=3,
+            uuid='base-snapshot-uuid',
+            total_record_count=10,
+            index_manifest=None,
+            watermark=latest_watermark,
+        )
+        commit_entry = Mock(kind=0)
+        commit_entry.file.row_count = 2
+        result = file_store_commit._try_commit_once(
+            retry_result=retry_result,
+            commit_kind='APPEND',
+            commit_entries=[commit_entry],
+            changelog_entries=[],
+            commit_identifier=11,
+            latest_snapshot=latest_snapshot,
+        )
+        return file_store_commit, result
+
+    def test_append_commit_inherits_watermark(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        file_store_commit, result = self._run_manifest_commit_attempt(
+            commit_result=True,
+            latest_watermark=123,
+        )
+
+        self.assertTrue(result.is_success())
+        committed_snapshot = (
+            file_store_commit.snapshot_commit.commit.call_args[0][1])
+        self.assertEqual(123, committed_snapshot.watermark)
+
+    def test_commit_retries_preserve_latest_manifests(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        retry_result = None
+        attempts = [
+            ['before-a', 'before-b'],
+            ['before-a', 'before-b', 'concurrent'],
+            # External maintenance may replace the manifests between attempts.
+            ['compacted', 'concurrent'],
+        ]
+        for i, names in enumerate(attempts):
+            current = [self._manifest_meta(name) for name in names]
+            file_store_commit, retry_result = self._run_manifest_commit_attempt(
+                commit_result=i == len(attempts) - 1,
+                retry_result=retry_result,
+                existing_manifests=current,
+            )
+            snapshot = file_store_commit.snapshot_commit.commit.call_args[0][1]
+            file_store_commit.manifest_list_manager.write.assert_any_call(
+                snapshot.base_manifest_list, current)
+            self.assertEqual(12, snapshot.total_record_count)
+            self.assertEqual(2, snapshot.delta_record_count)
+            self.mock_table.file_io.delete_quietly.assert_not_called()
+            if i < len(attempts) - 1:
+                self.assertIsInstance(retry_result, CommitFailRetryResult)
+                self.assertFalse(retry_result.commit_result_may_be_uncertain)
+                self.assertIsNone(retry_result.exception)
+            else:
+                self.assertTrue(retry_result.is_success())
+
+    def test_atomic_commit_exception_preserves_manifest_files(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        failure = TimeoutError('lost commit response')
+        _, result = self._run_manifest_commit_attempt(
+            commit_side_effect=failure)
+
+        self.assertIsInstance(result, CommitFailRetryResult)
+        self.assertIs(failure, result.exception)
+        self.assertTrue(result.commit_result_may_be_uncertain)
+        self.mock_table.file_io.delete_quietly.assert_not_called()
+
+    def test_prepare_failure_cleans_new_files_and_preserves_base_manifests(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        manager = mock_manifest_list_manager.return_value
+        manager.manifest_path = '/table/manifest'
+        mock_manifest_file_manager.return_value.manifest_path = '/table/manifest'
+        base = self._manifest_meta('base')
+        base.extra_files = ['base.sidecar']
+        delta = self._manifest_meta('delta')
+        lists = {}
+
+        def write_list(name, manifests):
+            lists[name] = manifests
+            if name.endswith('-0'):
+                raise OSError('base manifest list write failed')
+
+        manager.write.side_effect = write_list
+        manager.read.side_effect = lambda name: lists[name]
+        with self.assertRaisesRegex(RuntimeError, 'base manifest list write failed'):
+            self._run_manifest_commit_attempt(existing_manifests=[base])
+
+        deleted = {
+            args[0] for args, _ in self.mock_table.file_io.delete_quietly.call_args_list
+        }
+        self.assertEqual(
+            {'/table/manifest/' + name for name in lists}
+            | {'/table/manifest/' + delta.file_name},
+            deleted,
+        )
+
+    def test_retry_preserves_concurrently_added_manifest_sidecar(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        previous = self._manifest_meta('before')
+        _, retry_result = self._run_manifest_commit_attempt(
+            commit_result=False,
+            existing_manifests=[previous],
+        )
+        # A concurrent commit attaches a sidecar to the same manifest file.
+        current = replace(previous, extra_files=['before.avro.sidecar'])
+        file_store_commit, result = self._run_manifest_commit_attempt(
+            commit_result=True,
+            retry_result=retry_result,
+            existing_manifests=[current],
+        )
+
+        self.assertTrue(result.is_success())
+        base_manifests = (
+            file_store_commit.manifest_list_manager.write
+            .call_args_list[-1][0][1])
+        self.assertEqual([current], base_manifests)
+        self.assertEqual(['before.avro.sidecar'], base_manifests[0].extra_files)
+
+    def test_generate_partition_statistics_single_partition_single_file(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        """Test partition statistics generation with single partition and single file."""
+        # Create FileStoreCommit instance
+        file_store_commit = self._create_file_store_commit()
+
+        # Create test data
+        creation_time_dt = datetime(2024, 1, 15, 10, 30, 0)
+        from pypaimon.data.timestamp import Timestamp
+        from pypaimon.table.row.generic_row import GenericRow
+        from pypaimon.manifest.schema.simple_stats import SimpleStats
+        creation_time = Timestamp.from_local_date_time(creation_time_dt)
+        file_meta = DataFileMeta.create(
+            file_name="test_file_1.parquet",
+            file_size=1024 * 1024,  # 1MB
+            row_count=10000,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=1,
+            max_sequence_number=100,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            creation_time=creation_time,
+            external_path=None,
+            first_row_id=None,
+            write_cols=None
+        )
+
+        commit_message = CommitMessage(
+            partition=('2024-01-15', 'us-east-1'),
+            bucket=0,
+            new_files=[file_meta]
+        )
+
+        # Test method
+        statistics = file_store_commit._generate_partition_statistics(self._to_entries([commit_message]))
+
+        # Verify results
+        self.assertEqual(len(statistics), 1)
+
+        stat = statistics[0]
+        self.assertIsInstance(stat, PartitionStatistics)
+        self.assertEqual(stat.spec, {'dt': '2024-01-15', 'region': 'us-east-1'})
+        self.assertEqual(stat.record_count, 10000)
+        self.assertEqual(stat.file_count, 1)
+        self.assertEqual(stat.file_size_in_bytes, 1024 * 1024)
+        expected_time = file_meta.creation_time_epoch_millis()
+        self.assertEqual(stat.last_file_creation_time, expected_time)
+
+    def test_generate_partition_statistics_multiple_files_same_partition(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        """Test partition statistics generation with multiple files in same partition."""
+        # Create FileStoreCommit instance
+        file_store_commit = self._create_file_store_commit()
+
+        from pypaimon.data.timestamp import Timestamp
+        from pypaimon.table.row.generic_row import GenericRow
+        from pypaimon.manifest.schema.simple_stats import SimpleStats
+        creation_time_1 = Timestamp.from_local_date_time(datetime(2024, 1, 15, 10, 30, 0))
+        creation_time_2 = Timestamp.from_local_date_time(datetime(2024, 1, 15, 11, 30, 0))  # Later time
+
+        file_meta_1 = DataFileMeta.create(
+            file_name="test_file_1.parquet",
+            file_size=1024 * 1024,  # 1MB
+            row_count=10000,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=1,
+            max_sequence_number=100,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            creation_time=creation_time_1
+        )
+
+        file_meta_2 = DataFileMeta.create(
+            file_name="test_file_2.parquet",
+            file_size=2 * 1024 * 1024,  # 2MB
+            row_count=15000,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=101,
+            max_sequence_number=200,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            creation_time=creation_time_2
+        )
+
+        commit_message = CommitMessage(
+            partition=('2024-01-15', 'us-east-1'),
+            bucket=0,
+            new_files=[file_meta_1, file_meta_2]
+        )
+
+        # Test method
+        statistics = file_store_commit._generate_partition_statistics(self._to_entries([commit_message]))
+
+        # Verify results
+        self.assertEqual(len(statistics), 1)
+
+        stat = statistics[0]
+        self.assertEqual(stat.spec, {'dt': '2024-01-15', 'region': 'us-east-1'})
+        self.assertEqual(stat.record_count, 25000)  # 10000 + 15000
+        self.assertEqual(stat.file_count, 2)
+        self.assertEqual(stat.file_size_in_bytes, 3 * 1024 * 1024)  # 1MB + 2MB
+        expected_time = file_meta_2.creation_time_epoch_millis()
+        self.assertEqual(stat.last_file_creation_time, expected_time)
+
+    def test_partition_statistics_use_replacement_bucket_count(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        file_store_commit = self._create_file_store_commit()
+        file_meta = Mock(row_count=1, file_size=10, creation_time=None)
+
+        for old_buckets, new_buckets in [(-2, 2), (2, 3)]:
+            with self.subTest(old=old_buckets, new=new_buckets):
+                partition = GenericRow(['2024-01-15', 'us-east-1'], None)
+                entries = [
+                    ManifestEntry(
+                        kind=1,
+                        partition=partition,
+                        bucket=0,
+                        total_buckets=old_buckets,
+                        file=file_meta,
+                    ),
+                    ManifestEntry(
+                        kind=0,
+                        partition=partition,
+                        bucket=0,
+                        total_buckets=new_buckets,
+                        file=file_meta,
+                    ),
+                ]
+
+                statistics = (
+                    file_store_commit._generate_partition_statistics(entries))
+                self.assertEqual(new_buckets, statistics[0].total_buckets)
+
+    def test_generate_partition_statistics_multiple_partitions(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        """Test partition statistics generation with multiple different partitions."""
+        # Create FileStoreCommit instance
+        file_store_commit = self._create_file_store_commit()
+
+        creation_time_dt = datetime(2024, 1, 15, 10, 30, 0)
+        from pypaimon.data.timestamp import Timestamp
+        from pypaimon.table.row.generic_row import GenericRow
+        from pypaimon.manifest.schema.simple_stats import SimpleStats
+        creation_time = Timestamp.from_local_date_time(creation_time_dt)
+
+        # File for partition 1
+        file_meta_1 = DataFileMeta.create(
+            file_name="test_file_1.parquet",
+            file_size=1024 * 1024,
+            row_count=10000,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=1,
+            max_sequence_number=100,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            creation_time=creation_time,
+            external_path=None,
+            first_row_id=None,
+            write_cols=None
+        )
+
+        # File for partition 2
+        file_meta_2 = DataFileMeta.create(
+            file_name="test_file_2.parquet",
+            file_size=2 * 1024 * 1024,
+            row_count=20000,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=101,
+            max_sequence_number=200,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            creation_time=creation_time,
+            external_path=None,
+            first_row_id=None,
+            write_cols=None
+        )
+
+        commit_message_1 = CommitMessage(
+            partition=('2024-01-15', 'us-east-1'),
+            bucket=0,
+            new_files=[file_meta_1]
+        )
+
+        commit_message_2 = CommitMessage(
+            partition=('2024-01-15', 'us-west-2'),
+            bucket=0,
+            new_files=[file_meta_2]
+        )
+
+        # Test method
+        statistics = file_store_commit._generate_partition_statistics(
+            self._to_entries([commit_message_1, commit_message_2]))
+
+        # Verify results
+        self.assertEqual(len(statistics), 2)
+
+        # Sort statistics by partition spec for consistent testing
+        statistics.sort(key=lambda s: s.spec['region'])
+
+        # Check first partition (us-east-1)
+        stat_1 = statistics[0]
+        self.assertEqual(stat_1.spec, {'dt': '2024-01-15', 'region': 'us-east-1'})
+        self.assertEqual(stat_1.record_count, 10000)
+        self.assertEqual(stat_1.file_count, 1)
+        self.assertEqual(stat_1.file_size_in_bytes, 1024 * 1024)
+
+        # Check second partition (us-west-2)
+        stat_2 = statistics[1]
+        self.assertEqual(stat_2.spec, {'dt': '2024-01-15', 'region': 'us-west-2'})
+        self.assertEqual(stat_2.record_count, 20000)
+        self.assertEqual(stat_2.file_count, 1)
+        self.assertEqual(stat_2.file_size_in_bytes, 2 * 1024 * 1024)
+
+    def test_generate_partition_statistics_unpartitioned_table(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        """Test partition statistics generation for unpartitioned table."""
+        # Update mock table to have no partition keys
+        self.mock_table.partition_keys = []
+
+        # Create FileStoreCommit instance
+        file_store_commit = self._create_file_store_commit()
+
+        creation_time_dt = datetime(2024, 1, 15, 10, 30, 0)
+        from pypaimon.data.timestamp import Timestamp
+        from pypaimon.table.row.generic_row import GenericRow
+        from pypaimon.manifest.schema.simple_stats import SimpleStats
+        creation_time = Timestamp.from_local_date_time(creation_time_dt)
+        file_meta = DataFileMeta.create(
+            file_name="test_file_1.parquet",
+            file_size=1024 * 1024,
+            row_count=10000,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=1,
+            max_sequence_number=100,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            creation_time=creation_time,
+            external_path=None,
+            first_row_id=None,
+            write_cols=None
+        )
+
+        commit_message = CommitMessage(
+            partition=(),  # Empty partition for unpartitioned table
+            bucket=0,
+            new_files=[file_meta]
+        )
+
+        # Test method
+        statistics = file_store_commit._generate_partition_statistics(self._to_entries([commit_message]))
+
+        # Verify results
+        self.assertEqual(len(statistics), 1)
+
+        stat = statistics[0]
+        self.assertEqual(stat.spec, {})  # Empty spec for unpartitioned table
+        self.assertEqual(stat.record_count, 10000)
+        self.assertEqual(stat.file_count, 1)
+        self.assertEqual(stat.file_size_in_bytes, 1024 * 1024)
+
+    def test_generate_partition_statistics_no_creation_time(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        """Test partition statistics generation when file has no creation time."""
+        # Create FileStoreCommit instance
+        file_store_commit = self._create_file_store_commit()
+
+        file_meta = DataFileMeta(
+            file_name="test_file_1.parquet",
+            file_size=1024 * 1024,
+            row_count=10000,
+            min_key=None,
+            max_key=None,
+            key_stats=None,
+            value_stats=None,
+            min_sequence_number=1,
+            max_sequence_number=100,
+            schema_id=0,
+            level=0,
+            extra_files=None,
+        )
+
+        commit_message = CommitMessage(
+            partition=('2024-01-15', 'us-east-1'),
+            bucket=0,
+            new_files=[file_meta]
+        )
+
+        # Test method
+        statistics = file_store_commit._generate_partition_statistics(self._to_entries([commit_message]))
+
+        # Verify results
+        self.assertEqual(len(statistics), 1)
+
+        stat = statistics[0]
+        # Should have a valid timestamp (current time)
+        self.assertGreater(stat.last_file_creation_time, 0)
+
+    def test_generate_partition_statistics_mismatched_partition_keys(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        """Test partition statistics generation when partition tuple doesn't match partition keys."""
+        # Create FileStoreCommit instance
+        file_store_commit = self._create_file_store_commit()
+
+        # Table has 2 partition keys but partition tuple has 3 values
+        from pypaimon.data.timestamp import Timestamp
+        from pypaimon.table.row.generic_row import GenericRow
+        from pypaimon.manifest.schema.simple_stats import SimpleStats
+        file_meta = DataFileMeta.create(
+            file_name="test_file_1.parquet",
+            file_size=1024 * 1024,
+            row_count=10000,
+            min_key=GenericRow([], []),
+            max_key=GenericRow([], []),
+            key_stats=SimpleStats.empty_stats(),
+            value_stats=SimpleStats.empty_stats(),
+            min_sequence_number=1,
+            max_sequence_number=100,
+            schema_id=0,
+            level=0,
+            extra_files=[],
+            creation_time=Timestamp.from_local_date_time(datetime(2024, 1, 15, 10, 30, 0))
+        )
+
+        commit_message = CommitMessage(
+            partition=('2024-01-15', 'us-east-1', 'extra-value'),  # 3 values but table has 2 keys
+            bucket=0,
+            new_files=[file_meta]
+        )
+
+        # Test method
+        statistics = file_store_commit._generate_partition_statistics(self._to_entries([commit_message]))
+
+        # Verify results - should fallback to index-based naming
+        self.assertEqual(len(statistics), 1)
+
+        stat = statistics[0]
+        expected_spec = {
+            'partition_0': '2024-01-15',
+            'partition_1': 'us-east-1',
+            'partition_2': 'extra-value'
+        }
+        self.assertEqual(stat.spec, expected_spec)
+
+    def test_generate_partition_statistics_empty_commit_messages(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        """Test partition statistics generation with empty commit messages list."""
+        # Create FileStoreCommit instance
+        file_store_commit = self._create_file_store_commit()
+
+        # Test method
+        statistics = file_store_commit._generate_partition_statistics([])
+
+        # Verify results
+        self.assertEqual(len(statistics), 0)
+
+    def test_append_commit_inherits_index_manifest(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        file_store_commit = self._create_file_store_commit()
+
+        self.mock_table.identifier = 'default.test_table'
+        self.mock_table.table_schema = Mock()
+        self.mock_table.table_schema.id = 7
+        self.mock_table.options.row_tracking_enabled.return_value = False
+
+        snapshot_commit = MagicMock()
+        snapshot_commit.__enter__.return_value = snapshot_commit
+        snapshot_commit.__exit__.return_value = False
+        snapshot_commit.commit.return_value = True
+        file_store_commit.snapshot_commit = snapshot_commit
+
+        file_store_commit._write_manifest_files = Mock(return_value=[Mock()])
+        file_store_commit._generate_partition_statistics = Mock(return_value=[])
+        file_store_commit.manifest_list_manager.read_all.return_value = []
+
+        latest_snapshot = Mock()
+        latest_snapshot.id = 3
+        latest_snapshot.uuid = "base-snapshot-uuid"
+        latest_snapshot.total_record_count = 10
+        latest_snapshot.index_manifest = "index-manifest-existing"
+        latest_snapshot.watermark = None
+
+        commit_entry = Mock()
+        commit_entry.kind = 0
+        commit_entry.file = Mock()
+        commit_entry.file.row_count = 2
+
+        result = file_store_commit._try_commit_once(
+            retry_result=None,
+            commit_kind="APPEND",
+            commit_entries=[commit_entry],
+            changelog_entries=[],
+            commit_identifier=11,
+            latest_snapshot=latest_snapshot
+        )
+
+        self.assertTrue(result.is_success())
+        self.assertEqual(
+            "base-snapshot-uuid",
+            snapshot_commit.commit.call_args[0][0],
+        )
+        committed_snapshot = snapshot_commit.commit.call_args[0][1]
+        self.assertEqual(
+            "index-manifest-existing",
+            committed_snapshot.index_manifest
+        )
+        self.assertEqual(str(uuid.UUID(committed_snapshot.uuid)), committed_snapshot.uuid)
+
+    def test_null_partition_value(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        from pypaimon.data.timestamp import Timestamp
+        from pypaimon.manifest.schema.simple_stats import SimpleStats
+        from pypaimon.schema.data_types import DataField, AtomicType
+
+        file_store_commit = self._create_file_store_commit()
+        self.mock_table.partition_keys = ['dt']
+        self.mock_table.partition_keys_fields = [
+            DataField(0, 'dt', AtomicType('STRING'))
+        ]
+        self.mock_table.table_schema = Mock()
+        self.mock_table.table_schema.id = 0
+
+        file_store_commit.manifest_file_manager = Mock()
+        file_store_commit.manifest_file_manager.manifest_path = '/test/manifest'
+        self.mock_table.file_io.get_file_size.return_value = 1024
+
+        creation_time = Timestamp.from_local_date_time(datetime(2024, 1, 15, 10, 30, 0))
+
+        def make_file(name):
+            return DataFileMeta.create(
+                file_name=name,
+                file_size=1024,
+                row_count=100,
+                min_key=GenericRow([], []),
+                max_key=GenericRow([], []),
+                key_stats=SimpleStats.empty_stats(),
+                value_stats=SimpleStats.empty_stats(),
+                min_sequence_number=1,
+                max_sequence_number=10,
+                schema_id=0,
+                level=0,
+                extra_files=[],
+                creation_time=creation_time,
+            )
+
+        entries = [
+            ManifestEntry(kind=0, partition=GenericRow([None], None), bucket=0, total_buckets=None,
+                          file=make_file("f1.parquet")),
+            ManifestEntry(kind=0, partition=GenericRow(['2024-01-15'], None), bucket=0, total_buckets=None,
+                          file=make_file("f2.parquet")),
+        ]
+
+        result = file_store_commit._write_manifest_files(entries, "manifest-test")
+        self.assertIsNotNone(result)
+
+    def test_row_id_rewrite_respects_commit_retry_limit(
+            self, mock_manifest_list_manager, mock_manifest_file_manager):
+        file_store_commit = self._create_file_store_commit()
+        file_store_commit.commit_max_retries = 1
+        file_store_commit.commit_timeout = 10 ** 9
+        file_store_commit._commit_retry_wait = Mock()
+
+        latest_snapshot = Mock()
+        latest_snapshot.id = 7
+        file_store_commit.snapshot_manager.get_latest_snapshot.return_value = (
+            latest_snapshot
+        )
+
+        commit_entry = Mock()
+        rewrite = RewriteResult(RowIdRewriteResult([commit_entry], 1))
+        file_store_commit._try_commit_once = Mock(side_effect=[
+            rewrite,
+            rewrite,
+            AssertionError("rewrite retry budget was not enforced"),
+        ])
+
+        with self.assertRaises(RuntimeError) as ctx:
+            file_store_commit._try_commit(
+                commit_kind="APPEND",
+                commit_identifier=11,
+                commit_entries_plan=lambda snapshot: [commit_entry],
+            )
+
+        self.assertIn("with 1 retries", str(ctx.exception))
+        self.assertEqual(2, file_store_commit._try_commit_once.call_count)
+        file_store_commit._commit_retry_wait.assert_called_once_with(0)
+
+    @staticmethod
+    def _to_entries(commit_messages):
+        commit_entries = []
+        for msg in commit_messages:
+            partition = GenericRow(list(msg.partition), None)
+            for file in msg.new_files:
+                commit_entries.append(ManifestEntry(
+                    kind=0,
+                    partition=partition,
+                    bucket=msg.bucket,
+                    total_buckets=None,
+                    file=file
+                ))
+        return commit_entries

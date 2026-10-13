@@ -1,0 +1,1575 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.rest;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.PagedList;
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.TableType;
+import org.apache.paimon.annotation.Experimental;
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogUtils;
+import org.apache.paimon.catalog.Database;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.catalog.PropertyChange;
+import org.apache.paimon.catalog.TableMetadata;
+import org.apache.paimon.catalog.TableQueryAuthResult;
+import org.apache.paimon.consumer.ConsumerInfo;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.ResolvingFileIO;
+import org.apache.paimon.fs.cache.CachingFileIO;
+import org.apache.paimon.fs.cache.LocalCacheManager;
+import org.apache.paimon.function.Function;
+import org.apache.paimon.function.FunctionChange;
+import org.apache.paimon.management.LabelManagement;
+import org.apache.paimon.management.PermissionManagement;
+import org.apache.paimon.management.PolicyManagement;
+import org.apache.paimon.management.SemanticViewManagement;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.Partition;
+import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.rest.exceptions.AlreadyExistsException;
+import org.apache.paimon.rest.exceptions.BadRequestException;
+import org.apache.paimon.rest.exceptions.ForbiddenException;
+import org.apache.paimon.rest.exceptions.NoSuchResourceException;
+import org.apache.paimon.rest.exceptions.NotImplementedException;
+import org.apache.paimon.rest.exceptions.ServiceFailureException;
+import org.apache.paimon.rest.responses.AuthTableQueryResponse;
+import org.apache.paimon.rest.responses.ErrorResponse;
+import org.apache.paimon.rest.responses.GetDatabaseResponse;
+import org.apache.paimon.rest.responses.GetFunctionResponse;
+import org.apache.paimon.rest.responses.GetTableResponse;
+import org.apache.paimon.rest.responses.GetTagResponse;
+import org.apache.paimon.rest.responses.GetViewResponse;
+import org.apache.paimon.schema.FileSystemSchemaManager;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.FormatTable;
+import org.apache.paimon.table.Instant;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.TableSnapshot;
+import org.apache.paimon.table.format.FormatTablePartitionPathResolver;
+import org.apache.paimon.table.sink.BatchTableCommit;
+import org.apache.paimon.table.system.SystemTableLoader;
+import org.apache.paimon.utils.JsonSerdeUtil;
+import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.SnapshotNotExistException;
+import org.apache.paimon.utils.StringUtils;
+import org.apache.paimon.view.View;
+import org.apache.paimon.view.ViewChange;
+import org.apache.paimon.view.ViewImpl;
+import org.apache.paimon.view.ViewSchema;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.CoreOptions.BRANCH;
+import static org.apache.paimon.CoreOptions.PATH;
+import static org.apache.paimon.CoreOptions.TYPE;
+import static org.apache.paimon.catalog.CatalogUtils.checkNotBranch;
+import static org.apache.paimon.catalog.CatalogUtils.checkNotSystemDatabase;
+import static org.apache.paimon.catalog.CatalogUtils.checkNotSystemTable;
+import static org.apache.paimon.catalog.CatalogUtils.isSystemDatabase;
+import static org.apache.paimon.catalog.CatalogUtils.listPartitionsFromFileSystem;
+import static org.apache.paimon.catalog.CatalogUtils.validateCatalogManagedFormatTablePartitions;
+import static org.apache.paimon.catalog.CatalogUtils.validateCatalogManagedPartitionOptions;
+import static org.apache.paimon.catalog.CatalogUtils.validateCreateTable;
+import static org.apache.paimon.options.CatalogOptions.CASE_SENSITIVE;
+
+/** A catalog implementation for REST. */
+public class RESTCatalog implements Catalog {
+
+    private final RESTApi api;
+    private final CatalogContext context;
+    private final boolean dataTokenEnabled;
+    protected final Map<String, String> tableDefaultOptions;
+    private final @Nullable LocalCacheManager cacheManager;
+
+    public RESTCatalog(CatalogContext context) {
+        this(context, true);
+    }
+
+    public RESTCatalog(CatalogContext context, boolean configRequired) {
+        this.api = new RESTApi(context.options(), configRequired);
+        this.context =
+                CatalogContext.create(
+                        api.options(),
+                        context.hadoopConf(),
+                        context.preferIO(),
+                        context.fallbackIO());
+        this.dataTokenEnabled = api.options().get(RESTTokenFileIO.DATA_TOKEN_ENABLED);
+        this.tableDefaultOptions = CatalogUtils.tableDefaultOptions(this.context.options().toMap());
+        this.cacheManager = CachingFileIO.createCacheManager(this.context);
+    }
+
+    @Override
+    public Map<String, String> options() {
+        return context.options().toMap();
+    }
+
+    @Override
+    public RESTCatalogLoader catalogLoader() {
+        return new RESTCatalogLoader(context);
+    }
+
+    @Experimental
+    public PermissionManagement permissionManagement() {
+        return new RESTPermissionManagement(api);
+    }
+
+    @Experimental
+    public PolicyManagement policyManagement() {
+        return new RESTPolicyManagement(api);
+    }
+
+    @Experimental
+    public LabelManagement labelManagement() {
+        return new RESTLabelManagement(api);
+    }
+
+    /** Definition management for semantic views, using this catalog's configuration. */
+    @Experimental
+    public SemanticViewManagement semanticViewManagement() {
+        return new RESTSemanticViewManagement(api);
+    }
+
+    @Override
+    public List<String> listDatabases() {
+        return api.listDatabases();
+    }
+
+    @Override
+    public PagedList<String> listDatabasesPaged(
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String databaseNamePattern) {
+        return api.listDatabasesPaged(maxResults, pageToken, databaseNamePattern);
+    }
+
+    @Override
+    public void createDatabase(String name, boolean ignoreIfExists, Map<String, String> properties)
+            throws DatabaseAlreadyExistException {
+        checkNotSystemDatabase(name);
+        try {
+            api.createDatabase(name, properties);
+        } catch (AlreadyExistsException e) {
+            if (!ignoreIfExists) {
+                throw new DatabaseAlreadyExistException(name);
+            }
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(name, e);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    @Override
+    public Database getDatabase(String name) throws DatabaseNotExistException {
+        if (isSystemDatabase(name)) {
+            return Database.of(name);
+        }
+        try {
+            GetDatabaseResponse response = api.getDatabase(name);
+            Map<String, String> options = new HashMap<>(response.getOptions());
+            options.put(DB_LOCATION_PROP, response.getLocation());
+            response.putAuditOptionsTo(options);
+            return new Database.DatabaseImpl(name, options, options.get(COMMENT_PROP));
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(name);
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(name, e);
+        }
+    }
+
+    @Override
+    public void dropDatabase(String name, boolean ignoreIfNotExists, boolean cascade)
+            throws DatabaseNotExistException, DatabaseNotEmptyException {
+        checkNotSystemDatabase(name);
+        try {
+            if (!cascade && !this.listTables(name).isEmpty()) {
+                throw new DatabaseNotEmptyException(name);
+            }
+            api.dropDatabase(name);
+        } catch (NoSuchResourceException | DatabaseNotExistException e) {
+            if (!ignoreIfNotExists) {
+                throw new DatabaseNotExistException(name);
+            }
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(name, e);
+        }
+    }
+
+    @Override
+    public void alterDatabase(String name, List<PropertyChange> changes, boolean ignoreIfNotExists)
+            throws DatabaseNotExistException {
+        checkNotSystemDatabase(name);
+        try {
+            Pair<Map<String, String>, Set<String>> setPropertiesToRemoveKeys =
+                    PropertyChange.getSetPropertiesToRemoveKeys(changes);
+            Map<String, String> updateProperties = setPropertiesToRemoveKeys.getLeft();
+            Set<String> removeKeys = setPropertiesToRemoveKeys.getRight();
+            api.alterDatabase(name, new ArrayList<>(removeKeys), updateProperties);
+        } catch (NoSuchResourceException e) {
+            if (!ignoreIfNotExists) {
+                throw new DatabaseNotExistException(name);
+            }
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(name, e);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    @Override
+    public List<String> listTables(String databaseName) throws DatabaseNotExistException {
+        try {
+            if (isSystemDatabase(databaseName)) {
+                return SystemTableLoader.loadGlobalTableNames(context.options());
+            }
+            return api.listTables(databaseName);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName);
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(databaseName, e);
+        }
+    }
+
+    @Override
+    public PagedList<String> listTablesPaged(
+            String databaseName,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String tableNamePattern,
+            @Nullable String tableType)
+            throws DatabaseNotExistException {
+        try {
+            if (isSystemDatabase(databaseName)) {
+                CatalogUtils.validateNamePattern(this, tableNamePattern);
+                CatalogUtils.validateTableType(this, tableType);
+                return listSystemTablesPaged(maxResults, pageToken, tableNamePattern, tableType);
+            }
+            return api.listTablesPaged(
+                    databaseName, maxResults, pageToken, tableNamePattern, tableType);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName);
+        }
+    }
+
+    @Override
+    public PagedList<Table> listTableDetailsPaged(
+            String db,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String tableNamePattern,
+            @Nullable String tableType)
+            throws DatabaseNotExistException {
+        try {
+            if (isSystemDatabase(db)) {
+                CatalogUtils.validateNamePattern(this, tableNamePattern);
+                CatalogUtils.validateTableType(this, tableType);
+                PagedList<String> pagedSystemTableNames =
+                        listSystemTablesPaged(maxResults, pageToken, tableNamePattern, tableType);
+                List<Table> systemTables =
+                        pagedSystemTableNames.getElements().stream()
+                                .map(
+                                        tableName -> {
+                                            try {
+                                                return getTable(Identifier.create(db, tableName));
+                                            } catch (TableNotExistException ignored) {
+                                                return null;
+                                            }
+                                        })
+                                .filter(Objects::nonNull)
+                                .collect(Collectors.toList());
+                return new PagedList<>(systemTables, pagedSystemTableNames.getNextPageToken());
+            }
+            PagedList<GetTableResponse> tables =
+                    api.listTableDetailsPaged(
+                            db, maxResults, pageToken, tableNamePattern, tableType);
+            return new PagedList<>(
+                    tables.getElements().stream()
+                            .map(t -> toTable(db, t))
+                            .collect(Collectors.toList()),
+                    tables.getNextPageToken());
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(db);
+        }
+    }
+
+    private PagedList<String> listSystemTablesPaged(
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String tableNamePattern,
+            @Nullable String tableType) {
+        try {
+            return SystemTableLoader.loadGlobalTableNamesPaged(
+                    context.options(), maxResults, pageToken, tableNamePattern, tableType);
+        } catch (IllegalArgumentException e) {
+            throw new BadRequestException(e, "%s", e.getMessage());
+        }
+    }
+
+    @Override
+    public List<Table> listTableDetails(String databaseName) throws DatabaseNotExistException {
+        try {
+            if (isSystemDatabase(databaseName)) {
+                List<Table> result = new ArrayList<>();
+                for (String tableName : SystemTableLoader.loadGlobalTableNames(context.options())) {
+                    try {
+                        result.add(getTable(Identifier.create(databaseName, tableName)));
+                    } catch (TableNotExistException ignored) {
+                        // ignore
+                    }
+                }
+                return result;
+            }
+            List<GetTableResponse> tables = api.listTableDetails(databaseName);
+            return tables.stream().map(t -> toTable(databaseName, t)).collect(Collectors.toList());
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName);
+        }
+    }
+
+    @Override
+    public PagedList<Identifier> listTablesPagedGlobally(
+            @Nullable String databaseNamePattern,
+            @Nullable String tableNamePattern,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken) {
+        PagedList<Identifier> tables =
+                api.listTablesPagedGlobally(
+                        databaseNamePattern, tableNamePattern, maxResults, pageToken);
+        return new PagedList<>(tables.getElements(), tables.getNextPageToken());
+    }
+
+    @Override
+    public Table getTableById(String tableId) throws TableIdNotExistException {
+        try {
+            GetTableResponse response = api.getTableById(tableId);
+            String database = response.getDatabase();
+            return toTable(database, response);
+        } catch (NoSuchResourceException e) {
+            throw new TableIdNotExistException(tableId, e);
+        } catch (ForbiddenException e) {
+            throw new TableIdNoPermissionException(tableId, e);
+        }
+    }
+
+    @Override
+    public Table getTable(Identifier identifier) throws TableNotExistException {
+        return CatalogUtils.loadTable(
+                this,
+                identifier,
+                path -> fileIOForData(path, identifier),
+                this::fileIOFromOptions,
+                this::loadTableMetadata,
+                null,
+                null,
+                context,
+                true);
+    }
+
+    @Override
+    public Optional<TableSnapshot> loadSnapshot(Identifier identifier)
+            throws TableNotExistException {
+        try {
+            return Optional.ofNullable(api.loadSnapshot(identifier));
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_SNAPSHOT)) {
+                return Optional.empty();
+            }
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public Optional<Snapshot> loadSnapshot(Identifier identifier, String version)
+            throws TableNotExistException {
+        try {
+            return Optional.ofNullable(api.loadSnapshot(identifier, version));
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_SNAPSHOT)) {
+                return Optional.empty();
+            }
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public PagedList<Snapshot> listSnapshotsPaged(
+            Identifier identifier, @Nullable Integer maxResults, @Nullable String pageToken)
+            throws TableNotExistException {
+        try {
+            return api.listSnapshotsPaged(identifier, maxResults, pageToken);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public PagedList<ConsumerInfo> listConsumersPaged(
+            Identifier identifier, @Nullable Integer maxResults, @Nullable String pageToken)
+            throws TableNotExistException {
+        try {
+            return api.listConsumersPaged(identifier, maxResults, pageToken);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public void resetConsumer(
+            Identifier identifier, String consumerId, @Nullable Long nextSnapshotId)
+            throws TableNotExistException {
+        try {
+            api.resetConsumer(identifier, consumerId, nextSnapshotId);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public boolean supportsListObjectsPaged() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsListByPattern() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsListTableByType() {
+        return true;
+    }
+
+    @Override
+    public boolean supportsVersionManagement() {
+        return true;
+    }
+
+    @Override
+    public Optional<TableSchema> loadSchema(Identifier identifier, String version)
+            throws TableNotExistException {
+        try {
+            return Optional.ofNullable(api.loadSchema(identifier, version));
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_SCHEMA)) {
+                return Optional.empty();
+            }
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public PagedList<TableSchema> listSchemasPaged(
+            Identifier identifier, @Nullable Integer maxResults, @Nullable String pageToken)
+            throws TableNotExistException {
+        try {
+            return api.listSchemasPaged(identifier, maxResults, pageToken);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public boolean commitSnapshot(
+            Identifier identifier,
+            @Nullable String tableUuid,
+            @Nullable String baseSnapshotUuid,
+            Snapshot snapshot,
+            List<PartitionStatistics> statistics)
+            throws TableNotExistException {
+        try {
+            return api.commitSnapshot(
+                    identifier, tableUuid, baseSnapshotUuid, snapshot, statistics);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier, e);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    @Override
+    public void rollbackTo(Identifier identifier, Instant instant, @Nullable Long fromSnapshot)
+            throws Catalog.TableNotExistException {
+        try {
+            api.rollbackTo(identifier, instant, fromSnapshot);
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_SNAPSHOT)) {
+                throw new IllegalArgumentException(
+                        String.format("Rollback snapshot '%s' doesn't exist.", e.resourceName()));
+            } else if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_TAG)) {
+                throw new IllegalArgumentException(
+                        String.format("Rollback tag '%s' doesn't exist.", e.resourceName()));
+            }
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public void rollbackSchema(Identifier identifier, long schemaId)
+            throws Catalog.TableNotExistException {
+        try {
+            api.rollbackSchema(identifier, schemaId);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    private TableMetadata loadTableMetadata(Identifier identifier) throws TableNotExistException {
+        // if the table is system table, we need to load table metadata from the system table's data
+        // table
+        Identifier loadTableIdentifier =
+                identifier.isSystemTable()
+                        ? new Identifier(
+                                identifier.getDatabaseName(),
+                                identifier.getTableName(),
+                                identifier.getBranchName())
+                        : identifier;
+
+        GetTableResponse response;
+        try {
+            response = api.getTable(loadTableIdentifier);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+
+        return toTableMetadata(identifier.getDatabaseName(), response);
+    }
+
+    private TableMetadata toTableMetadata(String db, GetTableResponse response) {
+        TableSchema schema = TableSchema.create(response.getSchemaId(), response.getSchema());
+        Map<String, String> options = new HashMap<>(schema.options());
+        options.put(PATH.key(), response.getPath());
+        response.putAuditOptionsTo(options);
+        Identifier identifier = Identifier.create(db, response.getName());
+        if (identifier.getBranchName() != null) {
+            options.put(BRANCH.key(), identifier.getBranchName());
+        }
+        return new TableMetadata(schema.copy(options), response.isExternal(), response.getId());
+    }
+
+    private Table toTable(String db, GetTableResponse response) {
+        Identifier identifier = Identifier.create(db, response.getName());
+        try {
+            return CatalogUtils.loadTable(
+                    this,
+                    identifier,
+                    path -> fileIOForData(path, identifier),
+                    this::fileIOFromOptions,
+                    i -> toTableMetadata(db, response),
+                    null,
+                    null,
+                    context,
+                    true);
+        } catch (TableNotExistException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public void createTable(Identifier identifier, Schema schema, boolean ignoreIfExists)
+            throws TableAlreadyExistException, DatabaseNotExistException {
+        try {
+            checkNotBranch(identifier, "createTable");
+            checkNotSystemTable(identifier, "createTable");
+            validateCreateTable(schema, dataTokenEnabled);
+            tableDefaultOptions.forEach(schema.options()::putIfAbsent);
+            validateCreateTable(schema, dataTokenEnabled);
+            // Defaults participate in the catalog-managed partition combination, so validate
+            // the effective options rather than only the explicit ones.
+            validateCatalogManagedFormatTablePartitions(
+                    identifier, schema.options(), schema.options().containsKey(PATH.key()));
+            createExternalTablePathIfNotExist(schema);
+            Schema newSchema = inferSchemaIfExternalPaimonTable(schema);
+            api.createTable(identifier, newSchema);
+        } catch (AlreadyExistsException e) {
+            if (!ignoreIfExists) {
+                throw new TableAlreadyExistException(identifier);
+            }
+        } catch (NotImplementedException e) {
+            throw new RuntimeException(new UnsupportedOperationException(e.getMessage()));
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(identifier.getDatabaseName());
+        } catch (BadRequestException e) {
+            throw new RuntimeException(new IllegalArgumentException(e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public void renameTable(Identifier fromTable, Identifier toTable, boolean ignoreIfNotExists)
+            throws TableNotExistException, TableAlreadyExistException {
+        checkNotBranch(fromTable, "renameTable");
+        checkNotBranch(toTable, "renameTable");
+        checkNotSystemTable(fromTable, "renameTable");
+        checkNotSystemTable(toTable, "renameTable");
+        try {
+            api.renameTable(fromTable, toTable);
+        } catch (NoSuchResourceException e) {
+            if (!ignoreIfNotExists) {
+                throw new TableNotExistException(fromTable);
+            }
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(fromTable, e);
+        } catch (AlreadyExistsException e) {
+            throw new TableAlreadyExistException(toTable);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    @Override
+    public void alterTable(
+            Identifier identifier, List<SchemaChange> changes, boolean ignoreIfNotExists)
+            throws TableNotExistException, ColumnAlreadyExistException, ColumnNotExistException {
+        checkNotSystemTable(identifier, "alterTable");
+        try {
+            api.alterTable(identifier, changes);
+        } catch (NoSuchResourceException e) {
+            if (!ignoreIfNotExists) {
+                if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_TABLE)) {
+                    throw new TableNotExistException(identifier);
+                } else if (StringUtils.equals(
+                        e.resourceType(), ErrorResponse.RESOURCE_TYPE_COLUMN)) {
+                    throw new ColumnNotExistException(identifier, e.resourceName());
+                }
+            }
+        } catch (AlreadyExistsException e) {
+            throw new ColumnAlreadyExistException(identifier, e.resourceName());
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (ServiceFailureException e) {
+            throw new IllegalStateException(e.getMessage());
+        } catch (NotImplementedException e) {
+            throw new UnsupportedOperationException(e.getMessage());
+        } catch (BadRequestException e) {
+            throw new RuntimeException(new IllegalArgumentException(e.getMessage()));
+        }
+    }
+
+    @Override
+    public void replaceTable(Identifier identifier, Schema newSchema, boolean ignoreIfNotExists)
+            throws TableNotExistException {
+        checkNotBranch(identifier, "replaceTable");
+        checkNotSystemTable(identifier, "replaceTable");
+        validateCreateTable(newSchema, dataTokenEnabled);
+        tableDefaultOptions.forEach(newSchema.options()::putIfAbsent);
+        validateCreateTable(newSchema, dataTokenEnabled);
+        // Defaults participate in the catalog-managed partition combination, so validate the
+        // effective options rather than only the explicit ones. Externality is not validated
+        // client-side here: a round-tripped schema of an internal table may carry the synthetic
+        // path option, and the server remains the authority for replace semantics.
+        validateCatalogManagedPartitionOptions(newSchema.options());
+        try {
+            api.replaceTable(identifier, newSchema);
+        } catch (NoSuchResourceException e) {
+            if (!ignoreIfNotExists) {
+                throw new TableNotExistException(identifier);
+            }
+        } catch (NotImplementedException e) {
+            throw new UnsupportedOperationException(e.getMessage());
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    @Override
+    public TableQueryAuthResult authTableQuery(Identifier identifier, @Nullable List<String> select)
+            throws TableNotExistException {
+        checkNotSystemTable(identifier, "authTable");
+        try {
+            AuthTableQueryResponse response = api.authTableQuery(identifier, select);
+            return new TableQueryAuthResult(response.filter(), response.columnMasking());
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (ServiceFailureException e) {
+            throw new IllegalStateException(e.getMessage());
+        } catch (NotImplementedException e) {
+            throw new UnsupportedOperationException(e.getMessage());
+        } catch (BadRequestException e) {
+            throw new RuntimeException(new IllegalArgumentException(e.getMessage()));
+        }
+    }
+
+    @Override
+    public void dropTable(Identifier identifier, boolean ignoreIfNotExists)
+            throws TableNotExistException {
+        checkNotBranch(identifier, "dropTable");
+        checkNotSystemTable(identifier, "dropTable");
+        try {
+            api.dropTable(identifier);
+        } catch (NoSuchResourceException e) {
+            if (!ignoreIfNotExists) {
+                throw new TableNotExistException(identifier);
+            }
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public void registerTable(Identifier identifier, String path)
+            throws TableAlreadyExistException {
+        try {
+            api.registerTable(identifier, path);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (AlreadyExistsException e) {
+            throw new TableAlreadyExistException(identifier);
+        } catch (ServiceFailureException e) {
+            throw new IllegalStateException(e.getMessage());
+        } catch (BadRequestException e) {
+            throw new RuntimeException(new IllegalArgumentException(e.getMessage()));
+        }
+    }
+
+    @Override
+    public void markDonePartitions(Identifier identifier, List<Map<String, String>> partitions)
+            throws TableNotExistException {
+        try {
+            api.markDonePartitions(identifier, partitions);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (NotImplementedException ignored) {
+            // not a metastore partitioned table
+        }
+    }
+
+    @Override
+    public void createPartitions(Identifier identifier, List<Map<String, String>> partitions)
+            throws TableNotExistException {
+        createPartitions(identifier, partitions, true, null, false, null);
+    }
+
+    @Override
+    public void createPartitions(
+            Identifier identifier,
+            List<Map<String, String>> partitions,
+            boolean ignoreIfExists,
+            @Nullable List<PartitionStatistics> statistics,
+            boolean replaceStatistics,
+            @Nullable List<Map<String, String>> partitionOptions)
+            throws TableNotExistException {
+        List<Map<String, String>> canonicalOptions =
+                canonicalizePartitionOptions(identifier, partitions, partitionOptions);
+        try {
+            api.createPartitions(
+                    identifier,
+                    partitions,
+                    ignoreIfExists,
+                    statistics,
+                    replaceStatistics,
+                    canonicalOptions);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (AlreadyExistsException e) {
+            // Server contract: with ignoreIfExists=false the whole batch is rejected atomically.
+            throw new IllegalStateException(
+                    String.format(
+                            "Some partitions of table %s already exist: %s",
+                            identifier, e.getMessage()));
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        } catch (NotImplementedException e) {
+            if (canonicalOptions == null) {
+                throw e;
+            }
+            throw new UnsupportedOperationException(
+                    String.format(
+                            "REST Catalog server does not support partition options for table %s.",
+                            identifier.getFullName()),
+                    e);
+        }
+    }
+
+    @Nullable
+    private List<Map<String, String>> canonicalizePartitionOptions(
+            Identifier identifier,
+            List<Map<String, String>> partitions,
+            @Nullable List<Map<String, String>> requested) {
+        if (requested == null) {
+            return null;
+        }
+        if (requested.size() != partitions.size()) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Partition options for table %s must align with all %d partition specs, but found %d.",
+                            identifier.getFullName(), partitions.size(), requested.size()));
+        }
+        Set<Map<String, String>> uniquePartitions = new HashSet<>();
+        List<Map<String, String>> canonical = new ArrayList<>(requested.size());
+        boolean hasOptions = false;
+        for (int i = 0; i < requested.size(); i++) {
+            Map<String, String> partition = partitions.get(i);
+            if (partition == null || !uniquePartitions.add(partition)) {
+                throw new IllegalArgumentException(
+                        "Partition specs must be non-null and unique when partition options are provided.");
+            }
+            Map<String, String> options = requested.get(i);
+            if (options == null) {
+                throw new IllegalArgumentException("Partition options must not contain null maps.");
+            }
+            if (options.entrySet().stream()
+                    .anyMatch(entry -> entry.getKey() == null || entry.getValue() == null)) {
+                throw new IllegalArgumentException(
+                        "Partition options must not contain null keys or values.");
+            }
+            Map<String, String> copied = new HashMap<>(options);
+            String location = copied.get(PATH.key());
+            if (location != null) {
+                try {
+                    // A partition location may be the table's own directory, which is how a
+                    // request returns a partition there, so what a partition may own is judged
+                    // where the table is known rather than here.
+                    copied.put(
+                            PATH.key(),
+                            FormatTablePartitionPathResolver.canonicalizeLocation(location, context)
+                                    .toString());
+                } catch (IllegalArgumentException e) {
+                    throw invalidPartitionLocation(identifier, partition, e);
+                }
+            }
+            hasOptions |= !copied.isEmpty();
+            canonical.add(copied);
+        }
+        return hasOptions ? canonical : null;
+    }
+
+    private static IllegalArgumentException invalidPartitionLocation(
+            Identifier identifier,
+            @Nullable Map<String, String> partition,
+            IllegalArgumentException cause) {
+        String message =
+                String.format(
+                        "Invalid custom partition location for partition %s of table %s.",
+                        partition, identifier.getFullName());
+        return new IllegalArgumentException(message, cause);
+    }
+
+    @Override
+    public void dropPartitions(Identifier identifier, List<Map<String, String>> partitions)
+            throws TableNotExistException {
+        Table table = getTable(identifier);
+        if (hasCatalogManagedPartitions(table)) {
+            // Unregistering is metadata-only on the server; deleting the data is the caller's
+            // job, done with the table FileIO afterwards.
+            try {
+                api.dropPartitions(identifier, partitions, true);
+            } catch (NoSuchResourceException e) {
+                throw new TableNotExistException(identifier);
+            } catch (ForbiddenException e) {
+                throw new TableNoPermissionException(identifier, e);
+            } catch (BadRequestException e) {
+                throw new IllegalArgumentException(e.getMessage());
+            }
+            return;
+        }
+        // Every other table keeps the default truncate-based data semantics.
+        try (BatchTableCommit commit = table.newBatchWriteBuilder().newCommit()) {
+            commit.truncatePartitions(partitions);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public List<Partition> listPartitions(Identifier identifier) throws TableNotExistException {
+        try {
+            return api.listPartitions(identifier);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (NotImplementedException e) {
+            Table table = getTable(identifier);
+            if (hasCatalogManagedPartitions(table)) {
+                throw e;
+            }
+            return listPartitionsFromFileSystem(table);
+        }
+    }
+
+    @Override
+    public PagedList<Partition> listPartitionsPaged(
+            Identifier identifier,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String partitionNamePattern)
+            throws TableNotExistException {
+        try {
+            return api.listPartitionsPaged(identifier, maxResults, pageToken, partitionNamePattern);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (NotImplementedException e) {
+            Table table = getTable(identifier);
+            if (hasCatalogManagedPartitions(table)) {
+                throw e;
+            }
+            return new PagedList<>(listPartitionsFromFileSystem(table), null);
+        }
+    }
+
+    @Override
+    public PagedList<Partition> listPartitionsByFilterPaged(
+            Identifier identifier,
+            Predicate predicate,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String partitionNamePattern)
+            throws TableNotExistException {
+        try {
+            return api.listPartitionsByFilterPaged(
+                    identifier,
+                    JsonSerdeUtil.toFlatJson(predicate),
+                    maxResults,
+                    pageToken,
+                    partitionNamePattern);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (NotImplementedException e) {
+            // HTTP 501 is transport detail; callers only see the Catalog-level capability.
+            throw new UnsupportedOperationException(
+                    "The REST server does not support listing partitions by filter.", e);
+        }
+    }
+
+    @Override
+    public List<Partition> listPartitionsByNames(
+            Identifier identifier, List<Map<String, String>> partitions)
+            throws TableNotExistException {
+        try {
+            return api.listPartitionsByNames(identifier, partitions);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (NotImplementedException e) {
+            Table table = getTable(identifier);
+            if (hasCatalogManagedPartitions(table)) {
+                throw e;
+            }
+            return listPartitionsFromFileSystem(table, partitions);
+        }
+    }
+
+    @Override
+    public void createBranch(Identifier identifier, String branch, @Nullable String fromTag)
+            throws TableNotExistException, BranchAlreadyExistException, TagNotExistException {
+        try {
+            api.createBranch(identifier, branch, fromTag);
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_TABLE)) {
+                throw new TableNotExistException(identifier, e);
+            } else if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_TAG)) {
+                throw new TagNotExistException(identifier, fromTag, e);
+            } else {
+                throw e;
+            }
+        } catch (AlreadyExistsException e) {
+            throw new BranchAlreadyExistException(identifier, branch, e);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    @Override
+    public void dropBranch(Identifier identifier, String branch) throws BranchNotExistException {
+        try {
+            api.dropBranch(identifier, branch);
+        } catch (NoSuchResourceException e) {
+            throw new BranchNotExistException(identifier, branch, e);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public void renameBranch(Identifier identifier, String fromBranch, String toBranch)
+            throws BranchNotExistException, BranchAlreadyExistException {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void fastForward(Identifier identifier, String branch) throws BranchNotExistException {
+        try {
+            api.fastForward(identifier, branch);
+        } catch (NoSuchResourceException e) {
+            throw new BranchNotExistException(identifier, branch, e);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public List<String> listBranches(Identifier identifier) throws TableNotExistException {
+        try {
+            return api.listBranches(identifier);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public boolean supportsPartitionModification() {
+        // Paimon tables use commit-based partition maintenance.
+        return false;
+    }
+
+    @Override
+    public List<String> listFunctions(String databaseName) throws DatabaseNotExistException {
+        try {
+            return api.listFunctions(databaseName);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName, e);
+        }
+    }
+
+    @Override
+    public org.apache.paimon.function.Function getFunction(Identifier identifier)
+            throws FunctionNotExistException {
+        try {
+            GetFunctionResponse response = api.getFunction(identifier);
+            return response.toFunction(identifier);
+        } catch (NoSuchResourceException e) {
+            throw new FunctionNotExistException(identifier, e);
+        }
+    }
+
+    @Override
+    public void createFunction(
+            Identifier identifier,
+            org.apache.paimon.function.Function function,
+            boolean ignoreIfExists)
+            throws FunctionAlreadyExistException, DatabaseNotExistException {
+        try {
+            api.createFunction(identifier, function);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(identifier.getDatabaseName(), e);
+        } catch (AlreadyExistsException e) {
+            if (ignoreIfExists) {
+                return;
+            }
+            throw new FunctionAlreadyExistException(identifier, e);
+        }
+    }
+
+    @Override
+    public void dropFunction(Identifier identifier, boolean ignoreIfNotExists)
+            throws FunctionNotExistException {
+        try {
+            api.dropFunction(identifier);
+        } catch (NoSuchResourceException e) {
+            if (ignoreIfNotExists) {
+                return;
+            }
+            throw new FunctionNotExistException(identifier, e);
+        }
+    }
+
+    @Override
+    public void alterFunction(
+            Identifier identifier, List<FunctionChange> changes, boolean ignoreIfNotExists)
+            throws FunctionNotExistException, DefinitionAlreadyExistException,
+                    DefinitionNotExistException {
+        try {
+            api.alterFunction(identifier, changes);
+        } catch (AlreadyExistsException e) {
+            throw new DefinitionAlreadyExistException(identifier, e.resourceName());
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_DEFINITION)) {
+                throw new DefinitionNotExistException(identifier, e.resourceName());
+            }
+            if (!ignoreIfNotExists) {
+                throw new FunctionNotExistException(identifier, e);
+            }
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    @Override
+    public PagedList<String> listFunctionsPaged(
+            String databaseName,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String functionNamePattern)
+            throws DatabaseNotExistException {
+        try {
+            return api.listFunctionsPaged(databaseName, maxResults, pageToken, functionNamePattern);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName);
+        }
+    }
+
+    @Override
+    public PagedList<Identifier> listFunctionsPagedGlobally(
+            @Nullable String databaseNamePattern,
+            @Nullable String functionNamePattern,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken) {
+        PagedList<Identifier> functions =
+                api.listFunctionsPagedGlobally(
+                        databaseNamePattern, functionNamePattern, maxResults, pageToken);
+        return new PagedList<>(functions.getElements(), functions.getNextPageToken());
+    }
+
+    @Override
+    public PagedList<Function> listFunctionDetailsPaged(
+            String databaseName,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String functionNamePattern)
+            throws DatabaseNotExistException {
+        try {
+            PagedList<GetFunctionResponse> functions =
+                    api.listFunctionDetailsPaged(
+                            databaseName, maxResults, pageToken, functionNamePattern);
+            return new PagedList<>(
+                    functions.getElements().stream()
+                            .map(v -> v.toFunction(Identifier.create(databaseName, v.name())))
+                            .collect(Collectors.toList()),
+                    functions.getNextPageToken());
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName);
+        }
+    }
+
+    @Override
+    public View getView(Identifier identifier) throws ViewNotExistException {
+        try {
+            GetViewResponse response = api.getView(identifier);
+            return toView(identifier.getDatabaseName(), response);
+        } catch (NoSuchResourceException e) {
+            throw new ViewNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new ViewNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public void dropView(Identifier identifier, boolean ignoreIfNotExists)
+            throws ViewNotExistException {
+        try {
+            api.dropView(identifier);
+        } catch (NoSuchResourceException e) {
+            if (!ignoreIfNotExists) {
+                throw new ViewNotExistException(identifier);
+            }
+        } catch (ForbiddenException e) {
+            throw new ViewNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public void createView(Identifier identifier, View view, boolean ignoreIfExists)
+            throws ViewAlreadyExistException, DatabaseNotExistException {
+        try {
+            ViewSchema schema =
+                    new ViewSchema(
+                            view.rowType().getFields(),
+                            view.query(),
+                            view.dialects(),
+                            view.comment().orElse(null),
+                            view.options());
+            api.createView(identifier, schema);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(identifier.getDatabaseName());
+        } catch (AlreadyExistsException e) {
+            if (!ignoreIfExists) {
+                throw new ViewAlreadyExistException(identifier);
+            }
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        } catch (ForbiddenException e) {
+            throw new ViewNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public List<String> listViews(String databaseName) throws DatabaseNotExistException {
+        try {
+            return CatalogUtils.isSystemDatabase(databaseName)
+                    ? Collections.emptyList()
+                    : api.listViews(databaseName);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName);
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(databaseName, e);
+        }
+    }
+
+    @Override
+    public PagedList<String> listViewsPaged(
+            String databaseName,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String viewNamePattern)
+            throws DatabaseNotExistException {
+        try {
+            return api.listViewsPaged(databaseName, maxResults, pageToken, viewNamePattern);
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(databaseName);
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(databaseName, e);
+        }
+    }
+
+    @Override
+    public PagedList<View> listViewDetailsPaged(
+            String db,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String viewNamePattern)
+            throws DatabaseNotExistException {
+        try {
+            PagedList<GetViewResponse> views =
+                    api.listViewDetailsPaged(db, maxResults, pageToken, viewNamePattern);
+            return new PagedList<>(
+                    views.getElements().stream()
+                            .map(v -> toView(db, v))
+                            .collect(Collectors.toList()),
+                    views.getNextPageToken());
+        } catch (NoSuchResourceException e) {
+            throw new DatabaseNotExistException(db);
+        } catch (ForbiddenException e) {
+            throw new DatabaseNoPermissionException(db, e);
+        }
+    }
+
+    @Override
+    public PagedList<Identifier> listViewsPagedGlobally(
+            @Nullable String databaseNamePattern,
+            @Nullable String viewNamePattern,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken) {
+        PagedList<Identifier> views =
+                api.listViewsPagedGlobally(
+                        databaseNamePattern, viewNamePattern, maxResults, pageToken);
+        return new PagedList<>(views.getElements(), views.getNextPageToken());
+    }
+
+    private ViewImpl toView(String db, GetViewResponse response) {
+        ViewSchema schema = response.getSchema();
+        Map<String, String> options = new HashMap<>(schema.options());
+        response.putAuditOptionsTo(options);
+        return new ViewImpl(
+                Identifier.create(db, response.getName()),
+                schema.fields(),
+                schema.query(),
+                schema.dialects(),
+                schema.comment(),
+                options);
+    }
+
+    @Override
+    public void renameView(Identifier fromView, Identifier toView, boolean ignoreIfNotExists)
+            throws ViewNotExistException, ViewAlreadyExistException {
+        try {
+            api.renameView(fromView, toView);
+        } catch (NoSuchResourceException e) {
+            if (!ignoreIfNotExists) {
+                throw new ViewNotExistException(fromView);
+            }
+        } catch (AlreadyExistsException e) {
+            throw new ViewAlreadyExistException(toView);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        } catch (ForbiddenException e) {
+            throw new ViewNoPermissionException(fromView, e);
+        }
+    }
+
+    @Override
+    public void alterView(
+            Identifier identifier, List<ViewChange> viewChanges, boolean ignoreIfNotExists)
+            throws ViewNotExistException, DialectAlreadyExistException, DialectNotExistException {
+        try {
+            api.alterView(identifier, viewChanges);
+        } catch (AlreadyExistsException e) {
+            throw new DialectAlreadyExistException(identifier, e.resourceName());
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_DIALECT)) {
+                throw new DialectNotExistException(identifier, e.resourceName());
+            }
+            if (!ignoreIfNotExists) {
+                throw new ViewNotExistException(identifier);
+            }
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        } catch (ForbiddenException e) {
+            throw new ViewNoPermissionException(identifier, e);
+        }
+    }
+
+    /**
+     * Get tag for table.
+     *
+     * @param identifier database name and table name.
+     * @param tagName tag name
+     * @return {@link GetTagResponse}
+     * @throws TableNotExistException if the table does not exist
+     * @throws TagNotExistException if the tag does not exist
+     * @throws TableNoPermissionException if don't have the permission for this table
+     */
+    @Override
+    public GetTagResponse getTag(Identifier identifier, String tagName)
+            throws TableNotExistException, TagNotExistException {
+        try {
+            return api.getTag(identifier, tagName);
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_TAG)) {
+                throw new TagNotExistException(identifier, tagName);
+            }
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    /**
+     * Create tag for table.
+     *
+     * @param identifier database name and table name.
+     * @param tagName tag name
+     * @param snapshotId optional snapshot id, if not provided uses latest snapshot
+     * @param timeRetained optional time retained as string (e.g., "1d", "12h", "30m")
+     * @param ignoreIfExists if true, ignore if tag already exists
+     * @throws TableNotExistException if the table does not exist
+     * @throws SnapshotNotExistException if the snapshot does not exist
+     * @throws TagAlreadyExistException if the tag already exists and ignoreIfExists is false
+     * @throws TableNoPermissionException if don't have the permission for this table
+     */
+    @Override
+    public void createTag(
+            Identifier identifier,
+            String tagName,
+            @Nullable Long snapshotId,
+            @Nullable String timeRetained,
+            boolean ignoreIfExists)
+            throws TableNotExistException, SnapshotNotExistException, TagAlreadyExistException {
+        try {
+            api.createTag(identifier, tagName, snapshotId, timeRetained);
+        } catch (AlreadyExistsException e) {
+            if (!ignoreIfExists) {
+                throw new TagAlreadyExistException(identifier, tagName);
+            }
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_SNAPSHOT)) {
+                throw new SnapshotNotExistException(
+                        String.format(
+                                "Snapshot %s in table %s doesn't exist.",
+                                e.resourceName(), identifier.getFullName()));
+            }
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        } catch (BadRequestException e) {
+            throw new IllegalArgumentException(e.getMessage());
+        }
+    }
+
+    /**
+     * Get paged list names of tags under this table. An empty list is returned if none tag exists.
+     *
+     * @param identifier database name and table name.
+     * @param maxResults Optional parameter indicating the maximum number of results to include in
+     *     the result. If maxResults is not specified or set to 0, will return the default number of
+     *     max results.
+     * @param pageToken Optional parameter indicating the next page token allows list to be start
+     *     from a specific point.
+     * @return a list of the names of tags with provided page size in this table and next page token
+     * @throws TableNotExistException if the table does not exist
+     * @throws TableNoPermissionException if don't have the permission for this table
+     */
+    @Override
+    public PagedList<String> listTagsPaged(
+            Identifier identifier,
+            @Nullable Integer maxResults,
+            @Nullable String pageToken,
+            @Nullable String tagNamePrefix)
+            throws TableNotExistException {
+        try {
+            return api.listTagsPaged(identifier, maxResults, pageToken, tagNamePrefix);
+        } catch (NoSuchResourceException e) {
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    /**
+     * Delete tag for table.
+     *
+     * @param identifier database name and table name.
+     * @param tagName tag name
+     * @throws TableNotExistException if the table does not exist
+     * @throws TagNotExistException if the tag does not exist
+     * @throws TableNoPermissionException if don't have the permission for this table
+     */
+    public void deleteTag(Identifier identifier, String tagName)
+            throws TableNotExistException, TagNotExistException {
+        try {
+            api.deleteTag(identifier, tagName);
+        } catch (NoSuchResourceException e) {
+            if (StringUtils.equals(e.resourceType(), ErrorResponse.RESOURCE_TYPE_TAG)) {
+                throw new TagNotExistException(identifier, tagName);
+            }
+            throw new TableNotExistException(identifier);
+        } catch (ForbiddenException e) {
+            throw new TableNoPermissionException(identifier, e);
+        }
+    }
+
+    @Override
+    public boolean caseSensitive() {
+        return context.options().getOptional(CASE_SENSITIVE).orElse(true);
+    }
+
+    @Override
+    public void close() throws Exception {}
+
+    @VisibleForTesting
+    RESTApi api() {
+        return api;
+    }
+
+    /**
+     * Whether the catalog owns this table's partitions, which is exactly whether loading it
+     * produced a partition manager. Reading the option instead would be a second answer to the same
+     * question, and the two can disagree on a table built outside the catalog.
+     */
+    private static boolean hasCatalogManagedPartitions(Table table) {
+        return table instanceof FormatTable && ((FormatTable) table).partitionManager() != null;
+    }
+
+    private FileIO fileIOForData(Path path, Identifier identifier) {
+        return CachingFileIO.wrapWithCachingIfNeeded(
+                dataTokenEnabled
+                        ? new RESTTokenFileIO(context, api, identifier, path)
+                        : fileIOFromOptions(path),
+                context,
+                cacheManager);
+    }
+
+    private FileIO fileIOFromOptions(Path path) {
+        // In some cases we only need to get the table object but won't need to access data, using
+        // ResolvingFileIO to avoid permission issue.
+        FileIO fileIO = new ResolvingFileIO();
+        fileIO.configure(context);
+        return fileIO;
+    }
+
+    private void createExternalTablePathIfNotExist(Schema schema) throws IOException {
+        Map<String, String> options = schema.options();
+        if (options.containsKey(CoreOptions.PATH.key())) {
+            Path path = new Path(options.get(PATH.key()));
+            try (FileIO fileIO = fileIOFromOptions(path)) {
+                if (!fileIO.exists(path)) {
+                    fileIO.mkdirs(path);
+                }
+            }
+        }
+    }
+
+    private Schema inferSchemaIfExternalPaimonTable(Schema schema) throws Exception {
+        TableType tableType = Options.fromMap(schema.options()).get(TYPE);
+        String externalLocation = schema.options().get(PATH.key());
+
+        if (TableType.TABLE.equals(tableType) && Objects.nonNull(externalLocation)) {
+            Path externalPath = new Path(externalLocation);
+            SchemaManager schemaManager =
+                    new FileSystemSchemaManager(fileIOFromOptions(externalPath), externalPath);
+            Optional<TableSchema> latest = schemaManager.latest();
+            if (latest.isPresent()) {
+                // Note we just validate schema here, will not create a new table
+                schemaManager.createTable(schema, true);
+                Schema existsSchema = latest.get().toSchema();
+                // use `owner` and `path` from the user provide schema
+                if (Objects.nonNull(schema.options().get(Catalog.OWNER_PROP))) {
+                    existsSchema
+                            .options()
+                            .put(Catalog.OWNER_PROP, schema.options().get(Catalog.OWNER_PROP));
+                }
+                existsSchema.options().put(PATH.key(), schema.options().get(PATH.key()));
+                return existsSchema;
+            }
+        }
+        return schema;
+    }
+}

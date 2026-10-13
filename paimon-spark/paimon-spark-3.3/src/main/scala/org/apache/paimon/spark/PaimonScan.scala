@@ -1,0 +1,116 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark
+
+import org.apache.paimon.partition.PartitionPredicate
+import org.apache.paimon.predicate.{FullTextSearch, HybridSearch, Predicate, TopN, VectorSearch}
+import org.apache.paimon.spark.read.{BinPackingSplits, VariantExtractionInfo}
+import org.apache.paimon.table.{BucketMode, FileStoreTable, InnerTable}
+import org.apache.paimon.table.source.{DataSplit, Split}
+
+import org.apache.spark.sql.connector.expressions._
+import org.apache.spark.sql.connector.read.SupportsReportPartitioning
+import org.apache.spark.sql.connector.read.partitioning.{KeyGroupedPartitioning, Partitioning, UnknownPartitioning}
+import org.apache.spark.sql.types.StructType
+
+case class PaimonScan(
+    table: InnerTable,
+    requiredSchema: StructType,
+    pushedPartitionFilters: Seq[PartitionPredicate],
+    pushedDataFilters: Seq[Predicate],
+    override val pushedLimit: Option[Int],
+    override val pushedTopN: Option[TopN],
+    override val pushedVectorSearch: Option[VectorSearch],
+    override val pushedHybridSearch: Option[HybridSearch] = None,
+    override val pushedFullTextSearch: Option[FullTextSearch] = None,
+    override val pushedVariantExtractions: Map[Seq[String], Seq[VariantExtractionInfo]] = Map.empty,
+    override val pushedMapSelectedKeys: Map[String, Seq[String]] = Map.empty,
+    preserveDataGrouping: Boolean = false)
+  extends PaimonBaseScan(table)
+  with SupportsReportPartitioning {
+
+  @transient
+  private lazy val extractBucketTransform: Option[Transform] = {
+    table match {
+      case fileStoreTable: FileStoreTable =>
+        val bucketSpec = fileStoreTable.bucketSpec()
+        if (bucketSpec.getBucketMode != BucketMode.HASH_FIXED) {
+          None
+        } else if (bucketSpec.getBucketKeys.size() > 1) {
+          None
+        } else {
+          // Spark does not support bucket with several input attributes,
+          // so we only support one bucket key case.
+          assert(bucketSpec.getNumBuckets > 0)
+          assert(bucketSpec.getBucketKeys.size() == 1)
+          extractBucketNumber() match {
+            case Some(num) =>
+              val bucketKey = bucketSpec.getBucketKeys.get(0)
+              if (requiredSchema.exists(f => conf.resolver(f.name, bucketKey))) {
+                Some(Expressions.bucket(num, bucketKey))
+              } else {
+                None
+              }
+
+            case _ => None
+          }
+        }
+
+      case _ => None
+    }
+  }
+
+  /** Extract the bucket number from the splits only if all splits have the same totalBuckets number. */
+  private def extractBucketNumber(): Option[Int] = {
+    val splits = inputSplits
+    if (splits.exists(!_.isInstanceOf[DataSplit])) {
+      None
+    } else {
+      val deduplicated =
+        splits.map(s => Option(s.asInstanceOf[DataSplit].totalBuckets())).toSeq.distinct
+
+      deduplicated match {
+        case Seq(Some(num)) => Some(num)
+        case _ => None
+      }
+    }
+  }
+
+  private def shouldDoBucketedScan: Boolean = {
+    preserveDataGrouping && extractBucketTransform.isDefined
+  }
+
+  // Since Spark 3.3
+  override def outputPartitioning: Partitioning = {
+    if (shouldDoBucketedScan) {
+      new KeyGroupedPartitioning(Array(extractBucketTransform.get), inputPartitions.size)
+    } else {
+      new UnknownPartitioning(0)
+    }
+  }
+
+  override def getInputPartitions(splits: Array[Split]): Seq[PaimonInputPartition] = {
+    if (!shouldDoBucketedScan || splits.exists(!_.isInstanceOf[DataSplit])) {
+      return super.getInputPartitions(splits)
+    }
+
+    BinPackingSplits(coreOptions, readRowSizeRatio)
+      .packByBucket(splits.map(_.asInstanceOf[DataSplit]))
+  }
+}

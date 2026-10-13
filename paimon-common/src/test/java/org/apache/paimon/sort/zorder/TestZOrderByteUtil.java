@@ -1,0 +1,650 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.sort.zorder;
+
+import org.apache.paimon.data.Decimal;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.DecimalType;
+import org.apache.paimon.types.RowType;
+
+import org.junit.Test;
+import org.testcontainers.shaded.com.google.common.primitives.UnsignedBytes;
+
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Random;
+
+import static org.apache.paimon.utils.RandomUtil.randomBytes;
+import static org.apache.paimon.utils.RandomUtil.randomString;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+/* This file is based on source code from the Iceberg Project (http://iceberg.apache.org/), licensed by the Apache
+ * Software Foundation (ASF) under the Apache License, Version 2.0. See the NOTICE file distributed with this work for
+ * additional information regarding copyright ownership. */
+
+/** Tests for {@link ZOrderByteUtils}. */
+public class TestZOrderByteUtil {
+    private static final byte IIIIIIII = (byte) 255;
+    private static final byte IOIOIOIO = (byte) 170;
+    private static final byte OIOIOIOI = (byte) 85;
+    private static final byte OOOOIIII = (byte) 15;
+    private static final byte OOOOOOOI = (byte) 1;
+    private static final byte OOOOOOOO = (byte) 0;
+
+    private static final int NUM_TESTS = 100000;
+    private static final int NUM_INTERLEAVE_TESTS = 1000;
+
+    private final Random random = new Random(42);
+
+    private String bytesToString(byte[] bytes) {
+        StringBuilder result = new StringBuilder();
+        for (byte b : bytes) {
+            result.append(String.format("%8s", Integer.toBinaryString(b & 0xFF)).replace(' ', '0'));
+        }
+        return result.toString();
+    }
+
+    /** Returns a non-0 length byte array. */
+    private byte[] generateRandomBytes() {
+        int length = Math.abs(random.nextInt(100) + 1);
+        return generateRandomBytes(length);
+    }
+
+    /** Returns a byte array of a specified length. */
+    private byte[] generateRandomBytes(int length) {
+        byte[] result = new byte[length];
+        random.nextBytes(result);
+        return result;
+    }
+
+    /** Test method to ensure correctness of byte interleaving code. */
+    private String interleaveStrings(String[] strings) {
+        StringBuilder result = new StringBuilder();
+        int totalLength = Arrays.stream(strings).mapToInt(String::length).sum();
+        int substringIndex = 0;
+        int characterIndex = 0;
+        while (characterIndex < totalLength) {
+            for (String str : strings) {
+                if (substringIndex < str.length()) {
+                    result.append(str.charAt(substringIndex));
+                    characterIndex++;
+                }
+            }
+            substringIndex++;
+        }
+        return result.toString();
+    }
+
+    /** Decimal z-values must order by value and stay distinct from the null sentinel. */
+    @Test
+    public void testZIndexerDecimalOrdering() {
+        RowType rowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField(0, "a", new DecimalType(20, 2)),
+                                new DataField(1, "b", new DecimalType(20, 2))));
+        ZIndexer indexer = new ZIndexer(rowType, Arrays.asList("a", "b"));
+        indexer.open();
+
+        // Two rows whose decimal z-values must order by value: (-1, 0) then (0, 1).
+        // Old code fed minimal two's-complement arrays into unsigned comparison,
+        // making -1 > 1 and 0 collide with the null sentinel.
+        GenericRow row1 = new GenericRow(2);
+        row1.setField(0, Decimal.fromBigDecimal(new BigDecimal("-1.00"), 20, 2));
+        row1.setField(1, Decimal.fromBigDecimal(new BigDecimal("0.00"), 20, 2));
+        GenericRow row2 = new GenericRow(2);
+        row2.setField(0, Decimal.fromBigDecimal(new BigDecimal("0.00"), 20, 2));
+        row2.setField(1, Decimal.fromBigDecimal(new BigDecimal("1.00"), 20, 2));
+
+        byte[] z1 = Arrays.copyOf(indexer.index(row1), indexer.size());
+        byte[] z2 = Arrays.copyOf(indexer.index(row2), indexer.size());
+        // Interleaved bits: column a dominates the high bits of the z-value.
+        assertThat(compareUnsigned(z1, z2)).isLessThan(0);
+
+        GenericRow rowNull = new GenericRow(2);
+        rowNull.setField(0, null);
+        rowNull.setField(1, null);
+        byte[] zNull = Arrays.copyOf(indexer.index(rowNull), indexer.size());
+        // The null sentinel (all-zero bytes) sorts below every real value.
+        assertThat(compareUnsigned(zNull, z1)).isLessThan(0);
+        assertThat(compareUnsigned(zNull, z2)).isLessThan(0);
+
+        // A large magnitude still orders correctly against the small positives: the fixed-width
+        // encoding holds the whole unscaled value rather than projecting it into 8 bytes.
+        GenericRow big = new GenericRow(2);
+        big.setField(0, Decimal.fromBigDecimal(new BigDecimal("92233720368547758.08"), 20, 2));
+        big.setField(1, Decimal.fromBigDecimal(new BigDecimal("0.00"), 20, 2));
+        byte[] zBig = Arrays.copyOf(indexer.index(big), indexer.size());
+        assertThat(compareUnsigned(zBig, z2)).isGreaterThan(0);
+
+        // Its negative counterpart orders below the small negatives, but still above the null
+        // sentinel.
+        Decimal minUnscaled =
+                Decimal.fromBigDecimal(new BigDecimal("-92233720368547758.08"), 20, 2);
+        GenericRow negativeBig = new GenericRow(2);
+        negativeBig.setField(0, minUnscaled);
+        negativeBig.setField(1, minUnscaled);
+        byte[] zNegativeBig = Arrays.copyOf(indexer.index(negativeBig), indexer.size());
+        assertThat(compareUnsigned(zNull, zNegativeBig)).isLessThan(0);
+        assertThat(compareUnsigned(zNegativeBig, z1)).isLessThan(0);
+    }
+
+    /**
+     * High-precision decimals must keep full clustering resolution: ordinary small values, their
+     * negatives, and values past the long range all get distinct, correctly ordered z-keys.
+     */
+    @Test
+    public void testZIndexerHighPrecisionDecimalClustering() {
+        RowType rowType =
+                new RowType(
+                        Arrays.asList(
+                                new DataField(0, "a", new DecimalType(38, 18)),
+                                new DataField(1, "b", new DecimalType(38, 18))));
+        ZIndexer indexer = new ZIndexer(rowType, Arrays.asList("a", "b"));
+        indexer.open();
+
+        // Strictly ascending values, including small ones well below an 8-byte projection's
+        // overflow point (which collapsed 0..18 to a single key), sub-unit fractions, negatives,
+        // and a value past Long.MAX_VALUE. Each must get a strictly greater z-key than the last.
+        List<String> ascending =
+                Arrays.asList(
+                        "-90",
+                        "-10",
+                        "-2",
+                        "-1",
+                        "0",
+                        "0.001",
+                        "0.002",
+                        "1",
+                        "2",
+                        "3",
+                        "10",
+                        "20",
+                        "90",
+                        "12345678901234567890.123456789012345678");
+        byte[] previous = null;
+        for (String value : ascending) {
+            byte[] key = highPrecisionKey(indexer, value);
+            if (previous != null) {
+                assertThat(compareUnsigned(previous, key)).isLessThan(0);
+            }
+            previous = key;
+        }
+
+        // Null sorts below every real value.
+        byte[] zNull = Arrays.copyOf(indexer.index(new GenericRow(2)), indexer.size());
+        assertThat(compareUnsigned(zNull, highPrecisionKey(indexer, "-90"))).isLessThan(0);
+    }
+
+    private static byte[] highPrecisionKey(ZIndexer indexer, String value) {
+        GenericRow row = new GenericRow(2);
+        row.setField(0, Decimal.fromBigDecimal(new BigDecimal(value), 38, 18));
+        row.setField(1, Decimal.fromBigDecimal(new BigDecimal("0"), 38, 18));
+        return Arrays.copyOf(indexer.index(row), indexer.size());
+    }
+
+    private static int compareUnsigned(byte[] left, byte[] right) {
+        for (int i = 0; i < left.length && i < right.length; i++) {
+            int a = left[i] & 0xFF;
+            int b = right[i] & 0xFF;
+            if (a != b) {
+                return Integer.compare(a, b);
+            }
+        }
+        return Integer.compare(left.length, right.length);
+    }
+
+    /**
+     * Ordered-bytes transforms must preserve value order across negatives for floats and doubles.
+     */
+    @Test
+    public void testFloatDoubleNegativeOrdering() {
+        float[] floats = {
+            -Float.MAX_VALUE,
+            -2.5f,
+            -1f,
+            -Float.MIN_VALUE,
+            0f,
+            Float.MIN_VALUE,
+            1f,
+            2.5f,
+            Float.MAX_VALUE
+        };
+        long prevF =
+                ZOrderByteUtils.floatToOrderedBytes(floats[0], ByteBuffer.allocate(8)).getLong(0);
+        for (int i = 1; i < floats.length; i++) {
+            long cur =
+                    ZOrderByteUtils.floatToOrderedBytes(floats[i], ByteBuffer.allocate(8))
+                            .getLong(0);
+            assertThat(Long.compareUnsigned(prevF, cur)).isLessThan(0);
+            prevF = cur;
+        }
+
+        double[] doubles = {
+            -Double.MAX_VALUE,
+            -2.5d,
+            -1d,
+            -Double.MIN_VALUE,
+            0d,
+            Double.MIN_VALUE,
+            1d,
+            2.5d,
+            Double.MAX_VALUE
+        };
+        long prevD =
+                ZOrderByteUtils.doubleToOrderedBytes(doubles[0], ByteBuffer.allocate(8)).getLong(0);
+        for (int i = 1; i < doubles.length; i++) {
+            long cur =
+                    ZOrderByteUtils.doubleToOrderedBytes(doubles[i], ByteBuffer.allocate(8))
+                            .getLong(0);
+            assertThat(Long.compareUnsigned(prevD, cur)).isLessThan(0);
+            prevD = cur;
+        }
+
+        // Dense walk of adjacent negative bit patterns: value strictly decreases, so
+        // the transformed unsigned value must strictly decrease too. The old shift-31
+        // flip inverts order for a fraction of adjacent negative pairs.
+        for (int i = 1; i < 1000; i++) {
+            int bits = 0xC0400000 + i; // starting at -3.0f, descending values
+            long prev =
+                    ZOrderByteUtils.floatToOrderedBytes(
+                                    Float.intBitsToFloat(bits - 1), ByteBuffer.allocate(8))
+                            .getLong(0);
+            long cur =
+                    ZOrderByteUtils.floatToOrderedBytes(
+                                    Float.intBitsToFloat(bits), ByteBuffer.allocate(8))
+                            .getLong(0);
+            assertThat(Long.compareUnsigned(prev, cur)).isGreaterThan(0);
+        }
+        for (int i = 0; i < 1000; i++) {
+            long bits = 0xC004000000000000L + i; // just below -2.5d, descending values
+            double v = Double.longBitsToDouble(bits);
+            long cur = ZOrderByteUtils.doubleToOrderedBytes(v, ByteBuffer.allocate(8)).getLong(0);
+            if (i > 0) {
+                long prev =
+                        ZOrderByteUtils.doubleToOrderedBytes(
+                                        Double.longBitsToDouble(bits - 1), ByteBuffer.allocate(8))
+                                .getLong(0);
+                assertThat(Long.compareUnsigned(prev, cur)).isGreaterThan(0);
+            }
+        }
+    }
+
+    /**
+     * Compares the result of a string based interleaving algorithm implemented above versus the
+     * binary bit-shifting algorithm used in ZOrderByteUtils. Either both algorithms are identically
+     * wrong or are both identically correct.
+     */
+    @Test
+    public void testInterleaveRandomExamples() {
+        for (int test = 0; test < NUM_INTERLEAVE_TESTS; test++) {
+            int numByteArrays = Math.abs(random.nextInt(6)) + 1;
+            byte[][] testBytes = new byte[numByteArrays][];
+            String[] testStrings = new String[numByteArrays];
+            for (int byteIndex = 0; byteIndex < numByteArrays; byteIndex++) {
+                testBytes[byteIndex] = generateRandomBytes();
+                testStrings[byteIndex] = bytesToString(testBytes[byteIndex]);
+            }
+
+            int zOrderSize = Arrays.stream(testBytes).mapToInt(column -> column.length).sum();
+            byte[] byteResult = ZOrderByteUtils.interleaveBits(testBytes, zOrderSize);
+            String byteResultAsString = bytesToString(byteResult);
+
+            String stringResult = interleaveStrings(testStrings);
+
+            assertEquals(
+                    stringResult,
+                    byteResultAsString,
+                    "String interleave didn't match byte interleave");
+        }
+    }
+
+    @Test
+    public void testReuseInterleaveBuffer() {
+        int numByteArrays = 2;
+        int colLength = 16;
+        ByteBuffer interleaveBuffer = ByteBuffer.allocate(numByteArrays * colLength);
+        for (int test = 0; test < NUM_INTERLEAVE_TESTS; test++) {
+            byte[][] testBytes = new byte[numByteArrays][];
+            String[] testStrings = new String[numByteArrays];
+            for (int byteIndex = 0; byteIndex < numByteArrays; byteIndex++) {
+                testBytes[byteIndex] = generateRandomBytes(colLength);
+                testStrings[byteIndex] = bytesToString(testBytes[byteIndex]);
+            }
+
+            byte[] byteResult =
+                    ZOrderByteUtils.interleaveBits(
+                            testBytes, numByteArrays * colLength, interleaveBuffer);
+            String byteResultAsString = bytesToString(byteResult);
+
+            String stringResult = interleaveStrings(testStrings);
+
+            assertEquals(
+                    stringResult,
+                    byteResultAsString,
+                    "String interleave didn't match byte interleave");
+        }
+    }
+
+    @Test
+    public void testInterleaveEmptyBits() {
+        byte[][] test = new byte[4][10];
+        byte[] expected = new byte[40];
+
+        assertArrayEquals(
+                expected, ZOrderByteUtils.interleaveBits(test, 40), "Should combine empty arrays");
+    }
+
+    @Test
+    public void testInterleaveFullBits() {
+        byte[][] test = new byte[4][];
+        test[0] = new byte[] {IIIIIIII, IIIIIIII};
+        test[1] = new byte[] {IIIIIIII};
+        test[2] = new byte[0];
+        test[3] = new byte[] {IIIIIIII, IIIIIIII, IIIIIIII};
+        byte[] expected = new byte[] {IIIIIIII, IIIIIIII, IIIIIIII, IIIIIIII, IIIIIIII, IIIIIIII};
+
+        assertArrayEquals(
+                expected, ZOrderByteUtils.interleaveBits(test, 6), "Should combine full arrays");
+    }
+
+    @Test
+    public void testInterleaveMixedBits() {
+        byte[][] test = new byte[4][];
+        test[0] = new byte[] {OOOOOOOI, IIIIIIII, OOOOOOOO, OOOOIIII};
+        test[1] = new byte[] {OOOOOOOI, OOOOOOOO, IIIIIIII};
+        test[2] = new byte[] {OOOOOOOI};
+        test[3] = new byte[] {OOOOOOOI};
+        byte[] expected =
+                new byte[] {
+                    OOOOOOOO, OOOOOOOO, OOOOOOOO, OOOOIIII, IOIOIOIO, IOIOIOIO, OIOIOIOI, OIOIOIOI,
+                    OOOOIIII
+                };
+        assertArrayEquals(
+                expected,
+                ZOrderByteUtils.interleaveBits(test, 9),
+                "Should combine mixed byte arrays");
+    }
+
+    @Test
+    public void testIntOrdering() {
+        ByteBuffer aBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        ByteBuffer bBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        for (int i = 0; i < NUM_TESTS; i++) {
+            int aInt = random.nextInt();
+            int bInt = random.nextInt();
+            int intCompare = Integer.signum(Integer.compare(aInt, bInt));
+            byte[] aBytes = ZOrderByteUtils.intToOrderedBytes(aInt, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.intToOrderedBytes(bInt, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    intCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of ints should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aInt,
+                            bInt,
+                            intCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testLongOrdering() {
+        ByteBuffer aBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        ByteBuffer bBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        for (int i = 0; i < NUM_TESTS; i++) {
+            long aLong = random.nextInt();
+            long bLong = random.nextInt();
+            int longCompare = Integer.signum(Long.compare(aLong, bLong));
+            byte[] aBytes = ZOrderByteUtils.longToOrderedBytes(aLong, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.longToOrderedBytes(bLong, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    longCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of longs should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aLong,
+                            bLong,
+                            longCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testShortOrdering() {
+        ByteBuffer aBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        ByteBuffer bBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        for (int i = 0; i < NUM_TESTS; i++) {
+            short aShort = (short) (random.nextInt() % (Short.MAX_VALUE + 1));
+            short bShort = (short) (random.nextInt() % (Short.MAX_VALUE + 1));
+            int longCompare = Integer.signum(Long.compare(aShort, bShort));
+            byte[] aBytes = ZOrderByteUtils.shortToOrderedBytes(aShort, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.shortToOrderedBytes(bShort, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    longCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of longs should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aShort,
+                            bShort,
+                            longCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testTinyOrdering() {
+        ByteBuffer aBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        ByteBuffer bBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        for (int i = 0; i < NUM_TESTS; i++) {
+            byte aByte = (byte) (random.nextInt() % (Byte.MAX_VALUE + 1));
+            byte bByte = (byte) (random.nextInt() % (Byte.MAX_VALUE + 1));
+            int longCompare = Integer.signum(Long.compare(aByte, bByte));
+            byte[] aBytes = ZOrderByteUtils.tinyintToOrderedBytes(aByte, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.tinyintToOrderedBytes(bByte, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    longCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of longs should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aByte,
+                            bByte,
+                            longCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testFloatOrdering() {
+        ByteBuffer aBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        ByteBuffer bBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        for (int i = 0; i < NUM_TESTS; i++) {
+            float aFloat = random.nextFloat();
+            float bFloat = random.nextFloat();
+            int floatCompare = Integer.signum(Float.compare(aFloat, bFloat));
+            byte[] aBytes = ZOrderByteUtils.floatToOrderedBytes(aFloat, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.floatToOrderedBytes(bFloat, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    floatCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of floats should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aFloat,
+                            bFloat,
+                            floatCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testDoubleOrdering() {
+        ByteBuffer aBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        ByteBuffer bBuffer = ZOrderByteUtils.allocatePrimitiveBuffer();
+        for (int i = 0; i < NUM_TESTS; i++) {
+            double aDouble = random.nextDouble();
+            double bDouble = random.nextDouble();
+            int doubleCompare = Integer.signum(Double.compare(aDouble, bDouble));
+            byte[] aBytes = ZOrderByteUtils.doubleToOrderedBytes(aDouble, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.doubleToOrderedBytes(bDouble, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    doubleCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of doubles should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aDouble,
+                            bDouble,
+                            doubleCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testStringOrdering() {
+        ByteBuffer aBuffer = ByteBuffer.allocate(128);
+        ByteBuffer bBuffer = ByteBuffer.allocate(128);
+        for (int i = 0; i < NUM_TESTS; i++) {
+            String aString = randomString(50);
+            String bString = randomString(50);
+            int stringCompare = Integer.signum(aString.compareTo(bString));
+            byte[] aBytes = ZOrderByteUtils.stringToOrderedBytes(aString, 128, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.stringToOrderedBytes(bString, 128, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    stringCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of strings should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aString,
+                            bString,
+                            stringCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testByteTruncateOrFill() {
+        ByteBuffer aBuffer = ByteBuffer.allocate(128);
+        ByteBuffer bBuffer = ByteBuffer.allocate(128);
+        for (int i = 0; i < NUM_TESTS; i++) {
+            byte[] aBytesRaw = randomBytes(50);
+            byte[] bBytesRaw = randomBytes(50);
+            int stringCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator()
+                                    .compare(aBytesRaw, bBytesRaw));
+            byte[] aBytes = ZOrderByteUtils.byteTruncateOrFill(aBytesRaw, 128, aBuffer).array();
+            byte[] bBytes = ZOrderByteUtils.byteTruncateOrFill(bBytesRaw, 128, bBuffer).array();
+            int byteCompare =
+                    Integer.signum(
+                            UnsignedBytes.lexicographicalComparator().compare(aBytes, bBytes));
+
+            assertEquals(
+                    stringCompare,
+                    byteCompare,
+                    String.format(
+                            "Ordering of strings should match ordering of bytes, %s ~ %s -> %s != %s ~ %s -> %s ",
+                            aBytesRaw,
+                            bBytesRaw,
+                            stringCompare,
+                            Arrays.toString(aBytes),
+                            Arrays.toString(bBytes),
+                            byteCompare));
+        }
+    }
+
+    @Test
+    public void testBooleanDistinctFromNullSentinel() {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.BOOLEAN(), DataTypes.BOOLEAN()},
+                        new String[] {"a", "b"});
+        ZIndexer indexer = new ZIndexer(rowType, Arrays.asList("a", "b"));
+        indexer.open();
+
+        byte[] nullBytes = zvalue(indexer, null);
+        byte[] falseBytes = zvalue(indexer, false);
+        byte[] trueBytes = zvalue(indexer, true);
+
+        // The three states have to be pairwise distinct, and NULL is the all-zero sentinel, so
+        // the unsigned order it puts them in is NULL, then FALSE, then TRUE.
+        Comparator<byte[]> unsigned = UnsignedBytes.lexicographicalComparator();
+        assertThat(unsigned.compare(nullBytes, falseBytes)).isNegative();
+        assertThat(unsigned.compare(falseBytes, trueBytes)).isNegative();
+        assertThat(nullBytes).isNotEqualTo(falseBytes);
+        assertThat(falseBytes).isNotEqualTo(trueBytes);
+        assertThat(nullBytes).isNotEqualTo(trueBytes);
+    }
+
+    /** {@code index()} hands back its internal buffer, so each result is copied out of it. */
+    private static byte[] zvalue(ZIndexer indexer, Boolean value) {
+        GenericRow row = new GenericRow(2);
+        row.setField(0, value);
+        row.setField(1, value);
+        return indexer.index(row).clone();
+    }
+}

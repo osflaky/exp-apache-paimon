@@ -1,0 +1,239 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import json
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from pypaimon.common.options.core_options import CoreOptions
+from pypaimon.common.file_io import FileIO
+from pypaimon.common.json_util import json_field
+from pypaimon.schema.data_types import (
+    DataField,
+    VectorType,
+    current_highest_field_id,
+    is_blob_file_field,
+)
+from pypaimon.schema.schema import Schema
+
+
+@dataclass
+class TableSchema:
+    PAIMON_07_VERSION = 1
+    PAIMON_08_VERSION = 2
+    CURRENT_VERSION = 3
+
+    FIELD_VERSION = "version"
+    FIELD_ID = "id"
+    FIELD_FIELDS = "fields"
+    FIELD_HIGHEST_FIELD_ID = "highestFieldId"
+    FIELD_PARTITION_KEYS = "partitionKeys"
+    FIELD_PRIMARY_KEYS = "primaryKeys"
+    FIELD_OPTIONS = "options"
+    FIELD_COMMENT = "comment"
+    FIELD_TIME_MILLIS = "timeMillis"
+
+    version: int = json_field(FIELD_VERSION, default=CURRENT_VERSION)
+    id: int = json_field(FIELD_ID, default=0)
+    fields: List[DataField] = json_field(FIELD_FIELDS, default_factory=list)
+    highest_field_id: int = json_field("highestFieldId", default=0)
+    partition_keys: List[str] = json_field(
+        FIELD_PARTITION_KEYS, default_factory=list)
+    primary_keys: List[str] = json_field(
+        FIELD_PRIMARY_KEYS, default_factory=list)
+    options: Dict[str, str] = json_field(FIELD_OPTIONS, default_factory=dict)
+    comment: Optional[str] = json_field(FIELD_COMMENT, default=None)
+    time_millis: int = json_field("timeMillis", default_factory=lambda: int(time.time() * 1000))
+
+    def cross_partition_update(self) -> bool:
+        if not self.primary_keys or not self.partition_keys:
+            return False
+
+        # Check if primary keys contain all partition keys
+        # Return True if they don't contain all (cross-partition update)
+        return not all(pk in self.primary_keys for pk in self.partition_keys)
+
+    @property
+    def bucket_keys(self) -> List[str]:
+        """Resolve the effective bucket-key column names.
+
+        Resolution rule matches Java ``TableSchema.bucketKeys()``: prefer
+        the explicit ``bucket-key`` option; otherwise fall back to primary
+        keys with partition keys stripped (the same convention writers
+        use).
+
+        Validation is intentionally narrower than Java's
+        ``originalBucketKeys()``: only ``unknown column name`` is checked
+        here. Java additionally enforces ``bucket-key`` ⊄ partition keys,
+        and (when primary keys are non-empty) ``bucket-key`` ⊆ primary
+        keys, but it does so once at schema construction. Doing the same
+        in a property would add per-read overhead and could surface
+        errors on tables already in the catalog. The narrow check here
+        is just enough to fail fast on the typo case.
+        """
+        configured = self.options.get(CoreOptions.BUCKET_KEY.key())
+        if configured and configured.strip():
+            keys = [k.strip() for k in configured.split(',') if k.strip()]
+            field_names = {f.name for f in self.fields}
+            missing = [k for k in keys if k not in field_names]
+            if missing:
+                raise ValueError(
+                    "bucket-key references unknown columns: {}".format(missing))
+            return keys
+        return [pk for pk in self.primary_keys if pk not in self.partition_keys]
+
+    @property
+    def logical_bucket_key_fields(self) -> List[DataField]:
+        """The ``DataField``s for ``bucket_keys``, in the order they were
+        declared. Mirrors Java ``TableSchema.logicalBucketKeyType()``.
+        """
+        field_map = {f.name: f for f in self.fields}
+        return [field_map[name] for name in self.bucket_keys]
+
+    def data_file_fields(
+        self, write_cols: Optional[List[str]]
+    ) -> List[DataField]:
+        """Return fields physically stored in a data file.
+
+        A null ``write_cols`` normally represents the full schema. For a
+        data-evolution schema which enables compact metadata and has dedicated
+        BLOB or vector fields, it represents every non-dedicated field instead.
+        Dedicated files retain explicit write columns.
+        """
+        if write_cols is not None:
+            fields_by_name = {field.name: field for field in self.fields}
+            return [
+                fields_by_name[name]
+                for name in write_cols
+                if name in fields_by_name
+            ]
+
+        core_options = CoreOptions.from_dict(self.options)
+        if (
+            not core_options.data_evolution_enabled(False)
+            or not core_options.data_evolution_write_cols_optimization_enabled(False)
+        ):
+            return list(self.fields)
+        inline_blob_fields = (
+            core_options.blob_descriptor_fields()
+            | core_options.blob_view_fields()
+        )
+        return [
+            field
+            for field in self.fields
+            if not (
+                is_blob_file_field(field)
+                and field.name not in inline_blob_fields
+            )
+            and not (
+                core_options.with_vector_format()
+                and isinstance(field.type, VectorType)
+            )
+        ]
+
+    def partial_file_write_cols(
+        self, write_cols: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        """Resolve columns for a partial file using compact metadata."""
+        if write_cols is not None:
+            return list(write_cols)
+        physical_fields = self.data_file_fields(None)
+        if len(physical_fields) == len(self.fields):
+            return None
+        return [field.name for field in physical_fields]
+
+    def to_schema(self) -> Schema:
+        return Schema(
+            fields=self.fields,
+            partition_keys=self.partition_keys,
+            primary_keys=self.primary_keys,
+            options=self.options,
+            comment=self.comment
+        )
+
+    @staticmethod
+    def from_schema(schema_id: int, schema: Schema) -> "TableSchema":
+        fields: List[DataField] = schema.fields
+        partition_keys: List[str] = schema.partition_keys
+        primary_keys: List[str] = schema.primary_keys
+        options: Dict[str, str] = schema.options
+        highest_field_id: int = current_highest_field_id(fields)
+
+        return TableSchema(
+            TableSchema.CURRENT_VERSION,
+            schema_id,
+            fields,
+            highest_field_id,
+            partition_keys,
+            primary_keys,
+            options,
+            schema.comment
+        )
+
+    @staticmethod
+    def from_path(file_io: FileIO, schema_path: str):
+        try:
+            json_str = file_io.read_file_utf8(schema_path)
+            return TableSchema.from_json(json_str)
+        except FileNotFoundError as e:
+            raise RuntimeError(f"Schema file not found: {schema_path}") from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to read schema from {schema_path}") from e
+
+    @staticmethod
+    def from_json(json_str: str):
+        try:
+            data = json.loads(json_str)
+            version = data.get(TableSchema.FIELD_VERSION, TableSchema.PAIMON_07_VERSION)
+            fields = [DataField.from_dict(field) for field in data[TableSchema.FIELD_FIELDS]]
+            options = data[TableSchema.FIELD_OPTIONS]
+            if version <= TableSchema.PAIMON_07_VERSION and CoreOptions.BUCKET.key() not in options:
+                options[CoreOptions.BUCKET.key()] = "1"
+            if version <= TableSchema.PAIMON_08_VERSION and CoreOptions.FILE_FORMAT.key() not in options:
+                options[CoreOptions.FILE_FORMAT.key()] = "orc"
+
+            return TableSchema(
+                version=version,
+                id=data[TableSchema.FIELD_ID],
+                fields=fields,
+                highest_field_id=data[TableSchema.FIELD_HIGHEST_FIELD_ID],
+                partition_keys=data[TableSchema.FIELD_PARTITION_KEYS],
+                primary_keys=data[TableSchema.FIELD_PRIMARY_KEYS],
+                options=options or {},
+                comment=data.get(TableSchema.FIELD_COMMENT),
+                time_millis=data.get(TableSchema.FIELD_TIME_MILLIS)
+            )
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid JSON format: {json_str}") from e
+        except KeyError as e:
+            raise RuntimeError(f"Missing required field in schema JSON: {e}") from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse schema from JSON: {e}") from e
+
+    def copy(self, new_options: Optional[Dict[str, str]] = None) -> "TableSchema":
+        return TableSchema(
+            version=self.version,
+            id=self.id,
+            fields=self.fields,
+            highest_field_id=self.highest_field_id,
+            partition_keys=self.partition_keys,
+            primary_keys=self.primary_keys,
+            options=new_options,
+            comment=self.comment,
+            time_millis=self.time_millis
+        )

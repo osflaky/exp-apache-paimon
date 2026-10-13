@@ -1,0 +1,266 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.table;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.KeyValue;
+import org.apache.paimon.KeyValueFileStore;
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.mergetree.compact.LookupMergeFunction;
+import org.apache.paimon.mergetree.compact.MergeFunctionFactory;
+import org.apache.paimon.operation.AbstractFileStoreWrite;
+import org.apache.paimon.operation.FileStoreScan;
+import org.apache.paimon.operation.KeyValueFileStoreScan;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.schema.KeyValueFieldsExtractor;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.query.LocalTableQuery;
+import org.apache.paimon.table.sink.TableWriteImpl;
+import org.apache.paimon.table.source.DataTableScan;
+import org.apache.paimon.table.source.InnerTableRead;
+import org.apache.paimon.table.source.KeyValueTableRead;
+import org.apache.paimon.table.source.MergeTreeSplitGenerator;
+import org.apache.paimon.table.source.PrimaryKeyBatchScan;
+import org.apache.paimon.table.source.SplitGenerator;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.ChainTableUtils;
+import org.apache.paimon.utils.RowKindFilter;
+
+import javax.annotation.Nullable;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.predicate.PredicateBuilder.and;
+import static org.apache.paimon.predicate.PredicateBuilder.pickTransformFieldMapping;
+import static org.apache.paimon.predicate.PredicateBuilder.splitAnd;
+
+/** {@link FileStoreTable} for primary key table. */
+public class PrimaryKeyFileStoreTable extends AbstractFileStoreTable {
+
+    private static final long serialVersionUID = 1L;
+
+    private transient KeyValueFileStore lazyStore;
+
+    @VisibleForTesting
+    PrimaryKeyFileStoreTable(FileIO fileIO, Path path, TableSchema tableSchema) {
+        this(fileIO, path, tableSchema, CatalogEnvironment.empty());
+    }
+
+    public PrimaryKeyFileStoreTable(
+            FileIO fileIO,
+            Path path,
+            TableSchema tableSchema,
+            CatalogEnvironment catalogEnvironment) {
+        super(fileIO, path, tableSchema, catalogEnvironment);
+    }
+
+    @Override
+    public KeyValueFileStore store() {
+        if (lazyStore == null) {
+            RowType rowType = tableSchema.logicalRowType();
+            CoreOptions options = CoreOptions.fromMap(tableSchema.options());
+            KeyValueFieldsExtractor extractor =
+                    PrimaryKeyTableUtils.PrimaryKeyFieldsExtractor.EXTRACTOR;
+
+            RowType keyType = new RowType(extractor.keyFields(tableSchema));
+            List<String> deleteNotNullFields = deleteNotNullFields(options);
+            RowType valueType =
+                    deleteNotNullFields == null
+                            ? rowType
+                            : rowType.copy(
+                                    rowType.getFields().stream()
+                                            .map(
+                                                    field ->
+                                                            deleteNotNullFields.contains(
+                                                                            field.name())
+                                                                    ? field
+                                                                    : field.copy(true))
+                                            .collect(Collectors.toList()));
+
+            MergeFunctionFactory<KeyValue> mfFactory =
+                    PrimaryKeyTableUtils.createMergeFunctionFactory(tableSchema);
+            if (options.needLookup()) {
+                mfFactory = LookupMergeFunction.wrap(mfFactory, options, keyType, valueType);
+            }
+
+            lazyStore =
+                    new KeyValueFileStore(
+                            fileIO(),
+                            schemaManager(),
+                            tableSchema,
+                            tableSchema.crossPartitionUpdate(),
+                            options,
+                            tableSchema.logicalPartitionType(),
+                            keyType,
+                            valueType,
+                            extractor,
+                            mfFactory,
+                            name(),
+                            catalogEnvironment);
+        }
+        return lazyStore;
+    }
+
+    @Override
+    protected SplitGenerator splitGenerator() {
+        CoreOptions options = store().options();
+        return new MergeTreeSplitGenerator(
+                store().newKeyComparator(),
+                options.splitTargetSize(),
+                options.splitOpenFileCost(),
+                options.deletionVectorsEnabled(),
+                options.mergeEngine());
+    }
+
+    @Override
+    public boolean supportStreamingReadOverwrite() {
+        return new CoreOptions(tableSchema.options()).streamingReadOverwrite();
+    }
+
+    @Override
+    protected BiConsumer<FileStoreScan, Predicate> nonPartitionFilterConsumer() {
+        return (scan, predicate) -> {
+            // currently we can only perform filter push down on keys
+            // consider this case:
+            //   data file 1: insert key = a, value = 1
+            //   data file 2: update key = a, value = 2
+            //   filter: value = 1
+            // if we perform filter push down on values, data file 1 will be chosen, but data
+            // file 2 will be ignored, and the final result will be key = a, value = 1 while the
+            // correct result is an empty set
+            List<Predicate> keyFilters =
+                    pickTransformFieldMapping(
+                            splitAnd(predicate),
+                            tableSchema.fieldNames(),
+                            tableSchema.trimmedPrimaryKeys());
+            if (!keyFilters.isEmpty()) {
+                ((KeyValueFileStoreScan) scan).withKeyFilter(and(keyFilters));
+            }
+
+            // support value filter in bucket level
+            ((KeyValueFileStoreScan) scan).withValueFilter(predicate);
+        };
+    }
+
+    @Override
+    public InnerTableRead newRead() {
+        return new KeyValueTableRead(
+                () -> store().newRead(),
+                () -> store().newBatchRawFileRead(),
+                schema(),
+                coreOptions(),
+                catalogEnvironment.dependencyReadContext());
+    }
+
+    @Override
+    public DataTableScan newScan() {
+        return newScan(FileStoreTable::newSnapshotReader);
+    }
+
+    @Override
+    public DataTableScan newScan(SnapshotReaderFactory snapshotReaderFactory) {
+        return new PrimaryKeyBatchScan(
+                this,
+                snapshotReaderFactory.create(this),
+                catalogEnvironment.tableQueryAuth(coreOptions()),
+                null);
+    }
+
+    @Override
+    public TableWriteImpl<KeyValue> newWrite(String commitUser) {
+        return newWrite(commitUser, null);
+    }
+
+    @Override
+    public TableWriteImpl<KeyValue> newWrite(String commitUser, @Nullable Integer writeId) {
+        return newWrite(store().newWrite(commitUser, writeId));
+    }
+
+    @Override
+    public TableWriteImpl<KeyValue> newPostponeFixedBucketWrite(
+            String commitUser, @Nullable Integer writeId) {
+        return newWrite(store().newPostponeFixedBucketWrite(commitUser));
+    }
+
+    private TableWriteImpl<KeyValue> newWrite(AbstractFileStoreWrite<KeyValue> storeWrite) {
+        KeyValue kv = new KeyValue();
+        List<String> deleteNotNullFields = deleteNotNullFields(coreOptions());
+        return new TableWriteImpl<>(
+                rowType(),
+                storeWrite,
+                createRowKeyExtractor(),
+                (record, rowKind) ->
+                        kv.replace(
+                                record.primaryKey(),
+                                KeyValue.UNKNOWN_SEQUENCE,
+                                rowKind,
+                                record.row()),
+                rowKindGenerator(),
+                RowKindFilter.of(coreOptions()),
+                deleteNotNullFields);
+    }
+
+    @Nullable
+    private List<String> deleteNotNullFields(CoreOptions options) {
+        if (options.mergeEngine() != CoreOptions.MergeEngine.DEDUPLICATE
+                || schema().crossPartitionUpdate()) {
+            return null;
+        }
+
+        List<String> fields = new ArrayList<>(schema().primaryKeys());
+        fields.addAll(options.sequenceField());
+        return fields;
+    }
+
+    @Override
+    public LocalTableQuery newLocalTableQuery() {
+        return new LocalTableQuery(this);
+    }
+
+    @Override
+    @Nullable
+    protected Runnable newExpireRunnable() {
+        if (coreOptions().bucket() == BucketMode.POSTPONE_BUCKET) {
+            return null;
+        }
+
+        Runnable expire = super.newExpireRunnable();
+        CoreOptions options = coreOptions();
+        if (expire == null || !ChainTableUtils.isScanFallbackDeltaBranch(options)) {
+            return expire;
+        }
+
+        FileStoreTable snapshotTable = switchToBranch(options.scanFallbackSnapshotBranch());
+        // Use the Snapshot branch's own retention and changelog lifecycle settings, not the
+        // Delta writer's runtime overrides.
+        ExpireSnapshots snapshotBranchExpire =
+                snapshotTable
+                        .newExpireSnapshots()
+                        .config(snapshotTable.coreOptions().expireConfig());
+        return () -> {
+            expire.run();
+            snapshotBranchExpire.expire();
+        };
+    }
+}

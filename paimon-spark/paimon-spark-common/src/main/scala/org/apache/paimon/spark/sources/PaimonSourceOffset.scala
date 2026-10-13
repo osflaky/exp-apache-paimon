@@ -1,0 +1,151 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark.sources
+
+import org.apache.paimon.table.source.snapshot.StartingContext
+import org.apache.paimon.utils.JsonSerdeUtil
+
+import org.apache.spark.sql.connector.read.streaming.Offset
+
+/**
+ * The implementation of [[Offset]] for paimon spark streaming source.
+ *
+ * @param snapshotId
+ *   the current snapshot id
+ * @param index
+ *   the index position of file in the current snapshot, start from 0
+ * @param scanSnapshot
+ *   whether to scan all files in the current snapshot
+ */
+case class PaimonSourceOffset(snapshotId: Long, index: Long, scanSnapshot: Boolean)
+  extends Offset
+  with Comparable[PaimonSourceOffset] {
+
+  // Keep this out of the case class constructor so the existing three-argument constructor,
+  // Product3 API and pattern matching remain compatible. It is initialized only by the companion
+  // factory.
+  private var totalSplitsValue: Option[Long] = None
+
+  private[spark] def totalSplits: Option[Long] = totalSplitsValue
+
+  def copy(
+      snapshotId: Long = this.snapshotId,
+      index: Long = this.index,
+      scanSnapshot: Boolean = this.scanSnapshot): PaimonSourceOffset = {
+    val copied = PaimonSourceOffset(snapshotId, index, scanSnapshot)
+    if (
+      snapshotId == this.snapshotId &&
+      scanSnapshot == this.scanSnapshot &&
+      totalSplitsValue.forall(_ > 0 || index == PaimonSourceOffset.INIT_OFFSET_INDEX)
+    ) {
+      copied.totalSplitsValue = totalSplitsValue
+    }
+    copied
+  }
+
+  private[spark] def snapshotCompleted: Boolean = {
+    totalSplits.exists(index == _ - 1)
+  }
+
+  /** Whether this offset is the cursor immediately after an empty full snapshot. */
+  private[spark] def emptySnapshotCompleted: Boolean = totalSplits.contains(0L)
+
+  override def json(): String = {
+    val node = JsonSerdeUtil.OBJECT_MAPPER_INSTANCE.createObjectNode()
+    node.put(PaimonSourceOffset.FIELD_SNAPSHOT_ID, snapshotId)
+    node.put(PaimonSourceOffset.FIELD_INDEX, index)
+    node.put(PaimonSourceOffset.FIELD_SCAN_SNAPSHOT, scanSnapshot)
+    totalSplits.foreach(node.put(PaimonSourceOffset.FIELD_TOTAL_SPLITS, _))
+    node.toString
+  }
+
+  override def compareTo(o: PaimonSourceOffset): Int = {
+    o match {
+      case PaimonSourceOffset(snapshotId, index, scanSnapshot) =>
+        val diff = this.snapshotId.compare(snapshotId)
+        if (diff == 0) {
+          this.index.compare(index)
+        } else {
+          diff
+        }
+    }
+  }
+}
+
+object PaimonSourceOffset {
+  //  index of the init offset, for we filter offset by (startOffset, endOffset]
+  val INIT_OFFSET_INDEX: Long = -1L
+
+  private val FIELD_SNAPSHOT_ID = "snapshotId"
+  private val FIELD_INDEX = "index"
+  private val FIELD_SCAN_SNAPSHOT = "scanSnapshot"
+  private val FIELD_TOTAL_SPLITS = "totalSplits"
+
+  def apply(version: Long, index: Long, scanSnapshot: Boolean): PaimonSourceOffset = {
+    new PaimonSourceOffset(
+      version,
+      index,
+      scanSnapshot
+    )
+  }
+
+  private[spark] def withTotalSplits(
+      snapshotId: Long,
+      index: Long,
+      scanSnapshot: Boolean,
+      totalSplits: Long): PaimonSourceOffset = {
+    require(
+      totalSplits > 0 ||
+        (totalSplits == 0 && index == INIT_OFFSET_INDEX && !scanSnapshot),
+      s"Total splits must be positive except for an empty full snapshot cursor, but was $totalSplits."
+    )
+    val offset = PaimonSourceOffset(snapshotId, index, scanSnapshot)
+    offset.totalSplitsValue = Some(totalSplits)
+    offset
+  }
+
+  def apply(offset: Any): PaimonSourceOffset = {
+    offset match {
+      case o: PaimonSourceOffset => o
+      case json: String =>
+        val node = JsonSerdeUtil.OBJECT_MAPPER_INSTANCE.readTree(json)
+        val snapshotId = node.get(FIELD_SNAPSHOT_ID).asLong()
+        val index = node.get(FIELD_INDEX).asLong()
+        val scanSnapshot = node.get(FIELD_SCAN_SNAPSHOT).asBoolean()
+        Option(node.get(FIELD_TOTAL_SPLITS)) match {
+          case Some(totalSplits) =>
+            withTotalSplits(snapshotId, index, scanSnapshot, totalSplits.asLong())
+          case None => PaimonSourceOffset(snapshotId, index, scanSnapshot)
+        }
+      case sc: StartingContext =>
+        PaimonSourceOffset(sc.getSnapshotId, INIT_OFFSET_INDEX, sc.getScanFullSnapshot)
+      case _ => throw new IllegalArgumentException(s"Can't parse $offset to PaimonSourceOffset.")
+    }
+  }
+
+  def gt(indexedDataSplit: IndexedDataSplit, start: PaimonSourceOffset): Boolean = {
+    indexedDataSplit.snapshotId > start.snapshotId ||
+    (indexedDataSplit.snapshotId == start.snapshotId && indexedDataSplit.index > start.index)
+  }
+
+  def le(indexedDataSplit: IndexedDataSplit, end: PaimonSourceOffset): Boolean = {
+    indexedDataSplit.snapshotId < end.snapshotId ||
+    (indexedDataSplit.snapshotId == end.snapshotId && indexedDataSplit.index <= end.index)
+  }
+}

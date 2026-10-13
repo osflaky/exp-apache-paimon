@@ -1,0 +1,456 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.sink.cdc;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.flink.sink.Committable;
+import org.apache.paimon.flink.sink.CommittableTypeInfo;
+import org.apache.paimon.flink.sink.StoreSinkWriteImpl;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.schema.FileSystemSchemaManager;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.SchemaUtils;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
+import org.apache.paimon.table.sink.CommitMessageImpl;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowKind;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.TraceableFileIO;
+
+import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.runtime.state.JavaSerializer;
+import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Tests for {@link CdcRecordStoreWriteOperator}. */
+public class CdcRecordStoreWriteOperatorTest {
+
+    @TempDir java.nio.file.Path tempDir;
+
+    private Path tablePath;
+    private String commitUser;
+
+    @BeforeEach
+    public void before() {
+        tablePath = new Path(TraceableFileIO.SCHEME + "://" + tempDir.toString());
+        commitUser = UUID.randomUUID().toString();
+    }
+
+    @AfterEach
+    public void after() {
+        // assert all connections are closed
+        Predicate<Path> pathPredicate = path -> path.toString().contains(tempDir.toString());
+        assertThat(TraceableFileIO.openInputStreams(pathPredicate)).isEmpty();
+        assertThat(TraceableFileIO.openOutputStreams(pathPredicate)).isEmpty();
+    }
+
+    @Test
+    @Timeout(30)
+    public void testAddColumn() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.BIGINT(), DataTypes.STRING()},
+                        new String[] {"pt", "k", "v"});
+
+        FileStoreTable table =
+                createFileStoreTable(
+                        rowType, Collections.singletonList("pt"), Arrays.asList("pt", "k"));
+        OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness =
+                createTestHarness(table);
+        harness.open();
+
+        Runner runner = new Runner(harness);
+        Thread t = new Thread(runner);
+        t.start();
+
+        // check that records with compatible schema can be processed immediately
+
+        Map<String, String> data = new HashMap<>();
+        data.put("pt", "0");
+        data.put("k", "1");
+        data.put("v", "10");
+        CdcRecord expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        CdcRecord actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        data = new HashMap<>();
+        data.put("pt", "0");
+        data.put("k", "2");
+        expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        // check that records with new data should be processed after schema is updated
+
+        data = new HashMap<>();
+        data.put("pt", "0");
+        data.put("k", "3");
+        data.put("v", "30");
+        data.put("v2", "300");
+        expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        actual = runner.poll(1);
+        assertThat(actual).isNull();
+
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+        schemaManager.commitChanges(SchemaChange.addColumn("v2", DataTypes.INT()));
+        actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        runner.stop();
+        t.join();
+        harness.close();
+    }
+
+    @Test
+    @Timeout(30)
+    public void testUpdateColumnType() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.INT(),
+                            DataTypes.INT(),
+                            DataTypes.FLOAT(),
+                            DataTypes.VARCHAR(5),
+                            DataTypes.VARBINARY(5)
+                        },
+                        new String[] {"k", "v1", "v2", "v3", "v4"});
+
+        FileStoreTable table =
+                createFileStoreTable(
+                        rowType, Collections.emptyList(), Collections.singletonList("k"));
+        OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness =
+                createTestHarness(table);
+        harness.open();
+
+        Runner runner = new Runner(harness);
+        Thread t = new Thread(runner);
+        t.start();
+
+        // check that records with compatible schema can be processed immediately
+
+        Map<String, String> data = new HashMap<>();
+        data.put("k", "1");
+        data.put("v1", "10");
+        data.put("v2", "0.625");
+        data.put("v3", "one");
+        data.put("v4", "b_one");
+        CdcRecord expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        CdcRecord actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        // check that records with new data should be processed after schema is updated
+
+        // int -> bigint
+
+        data = new HashMap<>();
+        data.put("k", "2");
+        data.put("v1", "12345678987654321");
+        data.put("v2", "0.25");
+        expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        actual = runner.poll(1);
+        assertThat(actual).isNull();
+
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+        schemaManager.commitChanges(SchemaChange.updateColumnType("v1", DataTypes.BIGINT()));
+        actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        // float -> double
+
+        data = new HashMap<>();
+        data.put("k", "3");
+        data.put("v1", "100");
+        data.put("v2", "1.0000000000009095");
+        expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        actual = runner.poll(1);
+        assertThat(actual).isNull();
+
+        schemaManager.commitChanges(SchemaChange.updateColumnType("v2", DataTypes.DOUBLE()));
+        actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        // varchar(5) -> varchar(10)
+
+        data = new HashMap<>();
+        data.put("k", "4");
+        data.put("v1", "40");
+        data.put("v3", "long four");
+        expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        actual = runner.poll(1);
+        assertThat(actual).isNull();
+
+        schemaManager.commitChanges(SchemaChange.updateColumnType("v3", DataTypes.VARCHAR(10)));
+        actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        // varbinary(5) -> varbinary(10)
+
+        data = new HashMap<>();
+        data.put("k", "5");
+        data.put("v1", "50");
+        data.put("v4", "long five~");
+        expected = new CdcRecord(RowKind.INSERT, data);
+        runner.offer(expected);
+        actual = runner.poll(1);
+        assertThat(actual).isNull();
+
+        schemaManager.commitChanges(SchemaChange.updateColumnType("v4", DataTypes.VARBINARY(10)));
+        actual = runner.take();
+        assertThat(actual).isEqualTo(expected);
+
+        runner.stop();
+        t.join();
+        harness.close();
+    }
+
+    private static RowType rowTypeWithComplexColumn(DataType complexType) {
+        return RowType.of(new DataType[] {DataTypes.INT(), complexType}, new String[] {"k", "v"});
+    }
+
+    private CdcRecord recordWithValue(String value) {
+        Map<String, String> data = new HashMap<>();
+        data.put("k", "1");
+        data.put("v", value);
+        return new CdcRecord(RowKind.INSERT, data);
+    }
+
+    /**
+     * A malformed MAP value must reach the corrupt record policy, the same way a malformed value of
+     * any other type does, instead of being silently written as an empty map.
+     */
+    @Test
+    @Timeout(30)
+    public void testCorruptMapRecordFailsLoudly() throws Exception {
+        Options options = new Options();
+        options.set(CdcRecordStoreWriteOperator.MAX_RETRY_NUM_TIMES, 1);
+        FileStoreTable table =
+                createFileStoreTable(
+                        rowTypeWithComplexColumn(
+                                DataTypes.MAP(DataTypes.STRING(), DataTypes.STRING())),
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        options);
+
+        OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness =
+                createTestHarness(table);
+        harness.open();
+
+        assertThatThrownBy(() -> harness.processElement(recordWithValue("{\"a\": "), 1))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Unable to process element. Possibly a corrupt record");
+
+        harness.close();
+    }
+
+    /** Same for ROW, which used to blow up later with an obscure error while writing the row. */
+    @Test
+    @Timeout(30)
+    public void testCorruptRowRecordFailsLoudly() throws Exception {
+        Options options = new Options();
+        options.set(CdcRecordStoreWriteOperator.MAX_RETRY_NUM_TIMES, 1);
+        FileStoreTable table =
+                createFileStoreTable(
+                        rowTypeWithComplexColumn(
+                                DataTypes.ROW(
+                                        new DataField(2, "f0", DataTypes.STRING()),
+                                        new DataField(3, "f1", DataTypes.STRING()))),
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        options);
+
+        OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness =
+                createTestHarness(table);
+        harness.open();
+
+        assertThatThrownBy(() -> harness.processElement(recordWithValue("{\"f0\": "), 1))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Unable to process element. Possibly a corrupt record");
+
+        harness.close();
+    }
+
+    /**
+     * With {@code cdc.skip-corrupt-record} the record must be dropped entirely, rather than written
+     * with an empty map in place of the value that failed to parse.
+     */
+    @Test
+    @Timeout(30)
+    public void testSkipCorruptMapRecord() throws Exception {
+        Options options = new Options();
+        options.set(CdcRecordStoreWriteOperator.MAX_RETRY_NUM_TIMES, 1);
+        options.set(CdcRecordStoreWriteOperator.SKIP_CORRUPT_RECORD, true);
+        FileStoreTable table =
+                createFileStoreTable(
+                        rowTypeWithComplexColumn(
+                                DataTypes.MAP(DataTypes.STRING(), DataTypes.STRING())),
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        options);
+
+        OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness =
+                createTestHarness(table);
+        harness.open();
+
+        harness.processElement(recordWithValue("{\"a\": "), 1);
+        harness.prepareSnapshotPreBarrier(1);
+
+        assertThat(harness.extractOutputValues())
+                .allSatisfy(
+                        committable ->
+                                assertThat(
+                                                ((CommitMessageImpl) committable.commitMessage())
+                                                        .newFilesIncrement()
+                                                        .newFiles())
+                                        .isEmpty());
+
+        harness.close();
+    }
+
+    private OneInputStreamOperatorTestHarness<CdcRecord, Committable> createTestHarness(
+            FileStoreTable table) throws Exception {
+        CdcRecordStoreWriteOperator.Factory operatorFactory =
+                new CdcRecordStoreWriteOperator.Factory(
+                        table,
+                        (t, commitUser, state, ioManager, memoryPoolFactory, metricGroup) ->
+                                new StoreSinkWriteImpl(
+                                        t,
+                                        commitUser,
+                                        state,
+                                        ioManager,
+                                        false,
+                                        false,
+                                        true,
+                                        memoryPoolFactory,
+                                        metricGroup),
+                        commitUser);
+        TypeSerializer<CdcRecord> inputSerializer = new JavaSerializer<>();
+        TypeSerializer<Committable> outputSerializer =
+                new CommittableTypeInfo().createSerializer(new ExecutionConfig());
+        OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness =
+                new OneInputStreamOperatorTestHarness<>(operatorFactory, inputSerializer);
+        harness.setup(outputSerializer);
+        return harness;
+    }
+
+    private FileStoreTable createFileStoreTable(
+            RowType rowType, List<String> partitions, List<String> primaryKeys) throws Exception {
+        return createFileStoreTable(rowType, partitions, primaryKeys, new Options());
+    }
+
+    private FileStoreTable createFileStoreTable(
+            RowType rowType,
+            List<String> partitions,
+            List<String> primaryKeys,
+            Options extraOptions)
+            throws Exception {
+        Options conf = new Options();
+        conf.set(CdcRecordStoreWriteOperator.RETRY_SLEEP_TIME, Duration.ofMillis(10));
+        conf.set(CoreOptions.BUCKET, 1);
+        extraOptions.toMap().forEach(conf::set);
+
+        TableSchema tableSchema =
+                SchemaUtils.forceCommit(
+                        new FileSystemSchemaManager(LocalFileIO.create(), tablePath),
+                        new Schema(rowType.getFields(), partitions, primaryKeys, conf.toMap(), ""));
+        return FileStoreTableFactory.create(LocalFileIO.create(), tablePath, tableSchema);
+    }
+
+    private static class Runner implements Runnable {
+
+        private final OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness;
+        private final BlockingQueue<CdcRecord> toProcess = new LinkedBlockingQueue<>();
+        private final BlockingQueue<CdcRecord> processed = new LinkedBlockingQueue<>();
+        private final AtomicBoolean running = new AtomicBoolean(true);
+
+        private Runner(OneInputStreamOperatorTestHarness<CdcRecord, Committable> harness) {
+            this.harness = harness;
+        }
+
+        private void offer(CdcRecord record) {
+            toProcess.offer(record);
+        }
+
+        private CdcRecord take() throws Exception {
+            return processed.take();
+        }
+
+        private CdcRecord poll(long seconds) throws Exception {
+            return processed.poll(seconds, TimeUnit.SECONDS);
+        }
+
+        private void stop() {
+            running.set(false);
+        }
+
+        @Override
+        public void run() {
+            long timestamp = 0;
+            try {
+                while (running.get()) {
+                    if (toProcess.isEmpty()) {
+                        Thread.sleep(10);
+                        continue;
+                    }
+
+                    CdcRecord record = toProcess.poll();
+                    harness.processElement(record, ++timestamp);
+                    processed.offer(record);
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+}

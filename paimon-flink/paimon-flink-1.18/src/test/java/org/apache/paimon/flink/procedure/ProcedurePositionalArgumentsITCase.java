@@ -1,0 +1,412 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.procedure;
+
+import org.apache.paimon.flink.CatalogITCaseBase;
+import org.apache.paimon.table.FileStoreTable;
+
+import org.apache.flink.types.Row;
+import org.apache.flink.util.CloseableIterator;
+import org.assertj.core.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Ensure that the legacy multiply overloaded CALL with positional arguments can be invoked. */
+public class ProcedurePositionalArgumentsITCase extends CatalogITCaseBase {
+
+    @Test
+    public void testCompactDatabaseAndTable() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+
+        assertThatCode(() -> sql("CALL sys.compact('default.T')")).doesNotThrowAnyException();
+        assertThatCode(() -> sql("CALL sys.compact('default.T', 'pt=1')"))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> sql("CALL sys.compact('default.T', '', '')"))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> sql("CALL sys.compact('default.T', 'pt=1', '', '')"))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> sql("CALL sys.compact('default.T', '', '', '', 'sink.parallelism=1')"))
+                .doesNotThrowAnyException();
+        assertThatCode(
+                        () ->
+                                sql(
+                                        "CALL sys.compact('default.T', '', '', '', 'sink.parallelism=1','pt=1')"))
+                .doesNotThrowAnyException();
+        assertThatCode(
+                        () ->
+                                sql(
+                                        "CALL sys.compact('default.T', '' ,'zorder', 'k', '','','5s', '')"))
+                .message()
+                .contains("sort compact do not support 'partition_idle_time'.");
+
+        assertThatCode(() -> sql("CALL sys.compact('default.T', '', '' ,'', '', '', '', 'full')"))
+                .doesNotThrowAnyException();
+
+        assertThatCode(() -> sql("CALL sys.compact_database('default')"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testExpirePartitionsProcedure() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " k STRING,"
+                        + " dt STRING,"
+                        + " PRIMARY KEY (k, dt) NOT ENFORCED"
+                        + ") PARTITIONED BY (dt) WITH ("
+                        + " 'bucket' = '1'"
+                        + ")");
+        FileStoreTable table = paimonTable("T");
+        sql("INSERT INTO T VALUES ('1', '2024-06-01')");
+        sql("INSERT INTO T VALUES ('2', '9024-06-01')");
+        assertThat(read(table)).containsExactlyInAnyOrder("1:2024-06-01", "2:9024-06-01");
+        assertThat(
+                        sql(
+                                "CALL sys.expire_partitions('default.T', '1 d', 'yyyy-MM-dd', '$dt', 'values-time')"))
+                .containsExactly(Row.of("dt=2024-06-01"));
+        assertThat(read(table)).containsExactlyInAnyOrder("2:9024-06-01");
+    }
+
+    private List<String> read(FileStoreTable table) throws IOException {
+        List<String> ret = new ArrayList<>();
+        table.newRead()
+                .createReader(table.newScan().plan().splits())
+                .forEachRemaining(row -> ret.add(row.getString(0) + ":" + row.getString(1)));
+        return ret;
+    }
+
+    @Test
+    public void testCreateDeleteTag() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k STRING,"
+                        + " dt STRING,"
+                        + " PRIMARY KEY (k, dt) NOT ENFORCED"
+                        + ") PARTITIONED BY (dt) WITH ("
+                        + " 'bucket' = '1'"
+                        + ")");
+        sql("insert into T values('k', '2024-01-01')");
+        sql("insert into T values('k2', '2024-01-02')");
+
+        sql("CALL sys.create_tag('default.T', 'tag1')");
+
+        assertThat(
+                        sql("select * from T /*+ OPTIONS('scan.tag-name'='tag1') */").stream()
+                                .map(Row::toString))
+                .containsExactlyInAnyOrder("+I[k2, 2024-01-02]", "+I[k, 2024-01-01]");
+
+        sql("CALL sys.rollback_to('default.T', 'tag1')");
+
+        assertThat(sql("select * from T").stream().map(Row::toString))
+                .containsExactlyInAnyOrder("+I[k2, 2024-01-02]", "+I[k, 2024-01-01]");
+
+        sql("CALL sys.delete_tag('default.T', 'tag1')");
+
+        assertThatThrownBy(
+                        () ->
+                                sql("select * from T /*+ OPTIONS('scan.tag-name'='tag1') */")
+                                        .stream()
+                                        .map(Row::toString))
+                .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Tag 'tag1' doesn't exist.");
+    }
+
+    @Test
+    public void testCreateDeleteAndForwardBranch() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " pt INT"
+                        + ", k INT"
+                        + ", v STRING"
+                        + ", PRIMARY KEY (pt, k) NOT ENFORCED"
+                        + " ) PARTITIONED BY (pt) WITH ("
+                        + " 'bucket' = '2'"
+                        + " )");
+
+        // snapshot 1.
+        sql("INSERT INTO T VALUES(1, 10, 'apple')");
+
+        // snapshot 2.
+        sql("INSERT INTO T VALUES(1, 20, 'dog')");
+
+        sql("CALL sys.create_tag('default.T', 'tag1', 1)");
+
+        sql("CALL sys.create_tag('default.T', 'tag2', 2)");
+
+        sql("CALL sys.create_branch('default.T', 'test', 'tag1')");
+        sql("CALL sys.create_branch('default.T', 'test2', 'tag2')");
+
+        assertThat(collectToString("SELECT branch_name FROM `T$branches`"))
+                .containsExactlyInAnyOrder("+I[test]", "+I[test2]");
+
+        sql("CALL sys.delete_branch('default.T', 'test')");
+
+        assertThat(collectToString("SELECT branch_name FROM `T$branches`"))
+                .containsExactlyInAnyOrder("+I[test2]");
+
+        sql("CALL sys.fast_forward('default.T', 'test2')");
+
+        // Branch `test` replaces the main branch.
+        assertThat(collectToString("SELECT * FROM `T`"))
+                .containsExactlyInAnyOrder("+I[1, 10, apple]", "+I[1, 20, dog]");
+    }
+
+    private List<String> collectToString(String sql) throws Exception {
+        List<String> result = new ArrayList<>();
+        try (CloseableIterator<Row> it = tEnv.executeSql(sql).collect()) {
+            while (it.hasNext()) {
+                result.add(it.next().toString());
+            }
+        }
+        return result;
+    }
+
+    @Test
+    public void testPartitionMarkDone() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+
+        assertThatCode(() -> sql("CALL sys.mark_partition_done('default.T', 'pt = 0')"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testMergeInto() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+        sql(
+                "CREATE TABLE S ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+
+        assertThatCode(
+                        () ->
+                                sql(
+                                        "CALL sys.merge_into('default.T', 'TT', '', 'S', 'TT.k = S.k', '', '', '', '', 'S.v IS NULL')"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testMigrateProcedures() {
+        sql(
+                "CREATE TABLE S ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+
+        assertThatThrownBy(() -> sql("CALL sys.migrate_database('hive', 'default', '')"))
+                .hasMessageContaining("Only support Hive Catalog.");
+        assertThatThrownBy(() -> sql("CALL sys.migrate_table('hive', 'default.T', '')"))
+                .hasMessageContaining("Only support Hive Catalog.");
+    }
+
+    @Test
+    public void testQueryService() {
+        sql(
+                "CREATE TABLE DIM (k INT PRIMARY KEY NOT ENFORCED, v INT) WITH ('bucket' = '2', 'continuous.discovery-interval' = '1ms')");
+        assertThatCode(
+                        () -> {
+                            CloseableIterator<Row> service =
+                                    streamSqlIter("CALL sys.query_service('default.DIM', 2)");
+                            service.close();
+                        })
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testRemoveOrphanFiles() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+        assertThatCode(() -> sql("CALL sys.remove_orphan_files('default.T')"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testRepair() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+        assertThatThrownBy(() -> sql("CALL sys.repair('default.T')"))
+                .hasStackTraceContaining("Catalog.repairTable");
+    }
+
+    @Test
+    public void testResetConsumer() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+        assertThatCode(() -> sql("CALL sys.reset_consumer('default.T', 'myid')"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testRepairEarliestSnapshot() throws Exception {
+        sql("CREATE TABLE T (k INT)");
+        FileStoreTable table = paimonTable("T");
+        table.fileIO().tryToWriteAtomic(table.snapshotManager().snapshotPath(1), "");
+        table.fileIO().tryToWriteAtomic(table.snapshotManager().snapshotPath(5), "");
+        table.snapshotManager().commitEarliestHint(1);
+        table.snapshotManager().commitLatestHint(5);
+
+        assertThat(sql("CALL sys.repair_earliest_snapshot('default.T', 5)"))
+                .containsExactly(Row.of(1L, 5L));
+    }
+
+    @Test
+    public void testRewriteFileIndex() {
+        sql(
+                "CREATE TABLE T ("
+                        + " k INT,"
+                        + " v INT,"
+                        + " pt INT,"
+                        + " PRIMARY KEY (k, pt) NOT ENFORCED"
+                        + ") PARTITIONED BY (pt) WITH ("
+                        + " 'write-only' = 'true',"
+                        + " 'bucket' = '1'"
+                        + ")");
+        assertThatCode(() -> sql("CALL sys.rewrite_file_index('default.T', 'pt = 0')"))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testExpireTags() throws Exception {
+        boolean tagTimeExpireEnabled = ThreadLocalRandom.current().nextBoolean();
+        sql(
+                "CREATE TABLE T ("
+                        + " k STRING,"
+                        + " dt STRING,"
+                        + " PRIMARY KEY (k, dt) NOT ENFORCED"
+                        + ") PARTITIONED BY (dt) WITH ("
+                        + " 'bucket' = '1',"
+                        + " 'tag.time-expire-enabled' = '%s'"
+                        + ")",
+                tagTimeExpireEnabled);
+
+        FileStoreTable table = paimonTable("T");
+        for (int i = 1; i <= 3; i++) {
+            sql("INSERT INTO T VALUES ('" + i + "', '" + i + "')");
+        }
+        assertThat(table.snapshotManager().snapshotCount()).isEqualTo(3L);
+
+        sql("CALL sys.create_tag('default.T', 'tag-1', 1)");
+        sql("CALL sys.create_tag('default.T', 'tag-2', 2, '1d')");
+        sql("CALL sys.create_tag('default.T', 'tag-3', 3, '1s')");
+
+        assertThat(sql("select count(*) from `T$tags`")).containsExactly(Row.of(3L));
+
+        Thread.sleep(1000);
+        assertThat(sql("CALL sys.expire_tags('default.T')"))
+                .containsExactlyInAnyOrder(Row.of("tag-3"));
+    }
+
+    @Test
+    public void testReplaceTags() throws Exception {
+        sql(
+                "CREATE TABLE T ("
+                        + " id INT,"
+                        + " NAME STRING,"
+                        + " PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket' = '1'"
+                        + ")");
+        sql("INSERT INTO T VALUES (1, 'a')");
+        sql("INSERT INTO T VALUES (2, 'b')");
+        assertThat(paimonTable("T").snapshotManager().snapshotCount()).isEqualTo(2L);
+
+        Assertions.assertThatThrownBy(() -> sql("CALL sys.replace_tag('default.T', 'test_tag')"))
+                .hasMessageContaining("Tag 'test_tag' doesn't exist.");
+
+        sql("CALL sys.create_tag('default.T', 'test_tag')");
+        assertThat(sql("select tag_name,snapshot_id,time_retained from `T$tags`"))
+                .containsExactly(Row.of("test_tag", 2L, null));
+
+        sql("CALL sys.replace_tag('default.T', 'test_tag', 1)");
+        assertThat(sql("select tag_name,snapshot_id,time_retained from `T$tags`"))
+                .containsExactly(Row.of("test_tag", 1L, null));
+
+        sql("CALL sys.replace_tag('default.T', 'test_tag', 2, '1 d')");
+        assertThat(sql("select tag_name,snapshot_id,time_retained from `T$tags`"))
+                .containsExactly(Row.of("test_tag", 2L, "PT24H"));
+    }
+}

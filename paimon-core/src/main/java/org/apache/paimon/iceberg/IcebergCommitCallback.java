@@ -1,0 +1,2174 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.iceberg;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.GenericArray;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.factories.Factory;
+import org.apache.paimon.factories.FactoryException;
+import org.apache.paimon.factories.FactoryUtil;
+import org.apache.paimon.fs.FileStatus;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.iceberg.manifest.IcebergConversions;
+import org.apache.paimon.iceberg.manifest.IcebergDataFileMeta;
+import org.apache.paimon.iceberg.manifest.IcebergManifestEntry;
+import org.apache.paimon.iceberg.manifest.IcebergManifestFile;
+import org.apache.paimon.iceberg.manifest.IcebergManifestFileMeta;
+import org.apache.paimon.iceberg.manifest.IcebergManifestList;
+import org.apache.paimon.iceberg.manifest.IcebergPartitionSummary;
+import org.apache.paimon.iceberg.metadata.IcebergDataField;
+import org.apache.paimon.iceberg.metadata.IcebergMetadata;
+import org.apache.paimon.iceberg.metadata.IcebergPartitionField;
+import org.apache.paimon.iceberg.metadata.IcebergPartitionSpec;
+import org.apache.paimon.iceberg.metadata.IcebergRef;
+import org.apache.paimon.iceberg.metadata.IcebergSchema;
+import org.apache.paimon.iceberg.metadata.IcebergSnapshot;
+import org.apache.paimon.iceberg.metadata.IcebergSnapshotSummary;
+import org.apache.paimon.index.DeletionVectorMeta;
+import org.apache.paimon.index.IndexFileHandler;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataFilePathFactory;
+import org.apache.paimon.manifest.IndexManifestEntry;
+import org.apache.paimon.manifest.ManifestCommittable;
+import org.apache.paimon.manifest.ManifestEntry;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.SchemaValidation;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.CommitCallback;
+import org.apache.paimon.table.sink.TagCallback;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.DeletionFile;
+import org.apache.paimon.table.source.RawFile;
+import org.apache.paimon.table.source.ScanMode;
+import org.apache.paimon.table.source.snapshot.SnapshotReader;
+import org.apache.paimon.tag.Tag;
+import org.apache.paimon.types.ArrayType;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.MapType;
+import org.apache.paimon.types.MultisetType;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.DataFilePathFactories;
+import org.apache.paimon.utils.FileStorePathFactory;
+import org.apache.paimon.utils.ManifestReadThreadPool;
+import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.Preconditions;
+import org.apache.paimon.utils.SnapshotManager;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
+
+import static org.apache.paimon.deletionvectors.DeletionVectorsIndexFile.DELETION_VECTORS_INDEX;
+
+/**
+ * A {@link CommitCallback} to create Iceberg compatible metadata, so Iceberg readers can read
+ * Paimon's {@link RawFile}.
+ */
+public class IcebergCommitCallback implements CommitCallback, TagCallback {
+
+    private static final Logger LOG = LoggerFactory.getLogger(IcebergCommitCallback.class);
+
+    // see org.apache.iceberg.hadoop.Util
+    private static final String VERSION_HINT_FILENAME = "version-hint.text";
+
+    private static final String PUFFIN_FORMAT = "puffin";
+
+    // Snapshot summary metric keys
+    private static final String SNAPSHOT_SUMMARY_ADDED_DATA_FILES = "added-data-files";
+    private static final String SNAPSHOT_SUMMARY_ADDED_RECORDS = "added-records";
+    private static final String SNAPSHOT_SUMMARY_ADDED_FILES_SIZE = "added-files-size";
+    private static final String SNAPSHOT_SUMMARY_DELETED_DATA_FILES = "deleted-data-files";
+    private static final String SNAPSHOT_SUMMARY_DELETED_RECORDS = "deleted-records";
+    private static final String SNAPSHOT_SUMMARY_REMOVED_FILES_SIZE = "removed-files-size";
+    private static final String SNAPSHOT_SUMMARY_CHANGED_PARTITION_COUNT =
+            "changed-partition-count";
+    private static final String SNAPSHOT_SUMMARY_TOTAL_RECORDS = "total-records";
+    private static final String SNAPSHOT_SUMMARY_TOTAL_DATA_FILES = "total-data-files";
+    private static final String SNAPSHOT_SUMMARY_TOTAL_FILES_SIZE = "total-files-size";
+    private static final String SNAPSHOT_SUMMARY_TOTAL_DELETE_FILES = "total-delete-files";
+    private static final String SNAPSHOT_SUMMARY_TOTAL_POSITION_DELETES = "total-position-deletes";
+    private static final String SNAPSHOT_SUMMARY_TOTAL_EQUALITY_DELETES = "total-equality-deletes";
+
+    private final FileStoreTable table;
+    private final String commitUser;
+
+    private final IcebergPathFactory pathFactory;
+    private final @Nullable IcebergMetadataCommitter metadataCommitter;
+
+    private final FileStorePathFactory fileStorePathFactory;
+    private final IcebergManifestFile manifestFile;
+    private final IcebergManifestList manifestList;
+    private final int formatVersion;
+
+    private final IndexFileHandler indexFileHandler;
+    private final boolean needAddDvToIceberg;
+
+    // -------------------------------------------------------------------------------------
+    // Public interface
+    // -------------------------------------------------------------------------------------
+
+    public IcebergCommitCallback(FileStoreTable table, String commitUser) {
+        this.table = table;
+        this.commitUser = commitUser;
+
+        IcebergOptions.StorageType storageType =
+                table.coreOptions().toConfiguration().get(IcebergOptions.METADATA_ICEBERG_STORAGE);
+        this.pathFactory = new IcebergPathFactory(catalogTableMetadataPath(table));
+
+        IcebergMetadataCommitterFactory metadataCommitterFactory;
+        try {
+            metadataCommitterFactory =
+                    FactoryUtil.discoverFactory(
+                            IcebergCommitCallback.class.getClassLoader(),
+                            IcebergMetadataCommitterFactory.class,
+                            storageType.committerFactoryIdentifier());
+        } catch (FactoryException e) {
+            metadataCommitterFactory = null;
+            // storage types without a committer have no factory by design, so a miss is expected
+            if (storageType.requiresMetadataCommitter()) {
+                LOG.warn(
+                        "No IcebergMetadataCommitterFactory for '{}={}' found on the classpath, so "
+                                + "table {} will not be synced to the external catalog (commits and "
+                                + "metadata files are unaffected). Check that the module providing it "
+                                + "is deployed and that its META-INF/services/{} entry survived "
+                                + "shading. Cause: {}",
+                        IcebergOptions.METADATA_ICEBERG_STORAGE.key(),
+                        storageType,
+                        table.fullName(),
+                        Factory.class.getName(),
+                        e.getMessage());
+            }
+        }
+        this.metadataCommitter =
+                metadataCommitterFactory == null ? null : metadataCommitterFactory.create(table);
+
+        this.fileStorePathFactory = table.store().pathFactory();
+        this.manifestFile = IcebergManifestFile.create(table, pathFactory);
+        this.manifestList = IcebergManifestList.create(table, pathFactory);
+
+        this.formatVersion =
+                table.coreOptions().toConfiguration().get(IcebergOptions.FORMAT_VERSION);
+        Preconditions.checkArgument(
+                formatVersion == IcebergMetadata.FORMAT_VERSION_V2
+                        || formatVersion == IcebergMetadata.FORMAT_VERSION_V3,
+                "Unsupported iceberg format version! Only version 2 or version 3 is valid, but current version is ",
+                formatVersion);
+
+        this.indexFileHandler = table.store().newIndexFileHandler();
+        this.needAddDvToIceberg = needAddDvToIceberg();
+    }
+
+    public static Path catalogTableMetadataPath(FileStoreTable table) {
+        Path icebergDBPath = catalogDatabasePath(table);
+        return new Path(icebergDBPath, String.format("%s/metadata", table.location().getName()));
+    }
+
+    public static Path catalogDatabasePath(FileStoreTable table) {
+        Path dbPath = table.location().getParent();
+        final String dbSuffix = ".db";
+
+        IcebergOptions.StorageType storageType =
+                table.coreOptions().toConfiguration().get(IcebergOptions.METADATA_ICEBERG_STORAGE);
+
+        IcebergOptions.StorageLocation storageLocation =
+                table.coreOptions()
+                        .toConfiguration()
+                        .getOptional(IcebergOptions.METADATA_ICEBERG_STORAGE_LOCATION)
+                        .orElse(inferDefaultMetadataLocation(storageType));
+
+        switch (storageLocation) {
+            case TABLE_LOCATION:
+                // Iceberg metadata is written beside the table, under the database's own location,
+                // so no warehouse (<db>.db) layout is required. This lets the table register in any
+                // catalog, including a database whose location is not a Paimon warehouse path (e.g.
+                // an externally-provisioned / cross-account catalog database).
+                return dbPath;
+            case CATALOG_STORAGE:
+                // Catalog-storage derives a warehouse-relative iceberg/<db>/ path by stripping the
+                // ".db" suffix, so it only applies under the Paimon <db>.db warehouse layout.
+                if (!dbPath.getName().endsWith(dbSuffix)) {
+                    throw new UnsupportedOperationException(
+                            String.format(
+                                    "Storage type %s with catalog-location Iceberg metadata requires a "
+                                            + "Paimon warehouse database (a <db>.db location); set "
+                                            + "metadata.iceberg.storage-location=table-location for a "
+                                            + "database with a non-warehouse location.",
+                                    storageType.name()));
+                }
+                String dbName =
+                        dbPath.getName()
+                                .substring(0, dbPath.getName().length() - dbSuffix.length());
+                return new Path(dbPath.getParent(), String.format("iceberg/%s/", dbName));
+            default:
+                throw new UnsupportedOperationException(
+                        "Unknown storage location " + storageLocation.name());
+        }
+    }
+
+    private static IcebergOptions.StorageLocation inferDefaultMetadataLocation(
+            IcebergOptions.StorageType storageType) {
+        switch (storageType) {
+            case TABLE_LOCATION:
+                return IcebergOptions.StorageLocation.TABLE_LOCATION;
+            case HIVE_CATALOG:
+            case HADOOP_CATALOG:
+            case REST_CATALOG:
+                return IcebergOptions.StorageLocation.CATALOG_STORAGE;
+            default:
+                throw new UnsupportedOperationException(
+                        "Unknown storage type: " + storageType.name());
+        }
+    }
+
+    @Override
+    public void close() throws Exception {}
+
+    @Override
+    public void call(Context context) {
+        createMetadata(
+                context.snapshot,
+                (removedFiles, addedFiles) ->
+                        collectFileChanges(context.deltaFiles, removedFiles, addedFiles),
+                context.indexFiles);
+    }
+
+    @Override
+    public void retry(ManifestCommittable committable) {
+        SnapshotManager snapshotManager = table.snapshotManager();
+        Snapshot snapshot =
+                snapshotManager
+                        .findSnapshotsForIdentifiers(
+                                commitUser, Collections.singletonList(committable.identifier()))
+                        .stream()
+                        .max(Comparator.comparingLong(Snapshot::id))
+                        .orElseThrow(
+                                () ->
+                                        new RuntimeException(
+                                                "There is no snapshot for commit user "
+                                                        + commitUser
+                                                        + " and identifier "
+                                                        + committable.identifier()
+                                                        + " for table "
+                                                        + table.name()
+                                                        + ". This is unexpected."));
+        long snapshotId = snapshot.id();
+        createMetadata(
+                snapshot,
+                (removedFiles, addedFiles) ->
+                        collectFileChanges(snapshotId, removedFiles, addedFiles),
+                indexFileHandler.scan(snapshot, DELETION_VECTORS_INDEX));
+    }
+
+    @Override
+    public void setTable(FileStoreTable table) {
+        // nothing to do
+    }
+
+    private void createMetadata(
+            Snapshot snapshot,
+            FileChangesCollector fileChangesCollector,
+            List<IndexManifestEntry> indexFiles) {
+        long snapshotId = snapshot.id();
+        try {
+            // a stale callback outliving a rollback (or drop and recreate) must do nothing;
+            // read the snapshot file directly - snapshot caches may predate the rollback
+            Snapshot current;
+            try {
+                current =
+                        SnapshotManager.tryFromPath(
+                                table.fileIO(), table.snapshotManager().snapshotPath(snapshotId));
+            } catch (FileNotFoundException e) {
+                return;
+            }
+            if (!commitIdentity(current).equals(commitIdentity(snapshot))) {
+                return;
+            }
+            // the snapshot cache may still hold a rolled-back timeline under reused ids;
+            // every by-id read below must see the disk state the guard just verified
+            table.snapshotManager().invalidateCache();
+
+            if (snapshotId == Snapshot.FIRST_SNAPSHOT_ID) {
+                // If Iceberg metadata is stored separately in another directory, dropping the table
+                // will not delete old Iceberg metadata. So we delete them here, when the table is
+                // created again and the first snapshot is committed.
+                table.fileIO().delete(pathFactory.metadataDirectory(), true);
+            }
+
+            String abandonedUuid = null;
+            int abandonedLastColumnId = 0;
+            long abandonedNextRowId = 0;
+            if (table.fileIO().exists(pathFactory.toMetadataPath(snapshotId))) {
+                if (metadataMatchesSnapshot(snapshotId, snapshot)) {
+                    // a retry repairs hint, pointer and files only while this snapshot is
+                    // still the head; a replay of an older committable must not move them back
+                    Long latestForRepair = table.snapshotManager().latestSnapshotId();
+                    if (latestForRepair == null || latestForRepair != snapshotId) {
+                        return;
+                    }
+                    if (readVersionHint() != snapshotId) {
+                        table.fileIO()
+                                .overwriteFileUtf8(
+                                        new Path(
+                                                pathFactory.metadataDirectory(),
+                                                VERSION_HINT_FILENAME),
+                                        String.valueOf(snapshotId));
+                    }
+                    if (metadataCommitter != null) {
+                        // recommit the pointer (previous version as base, so a lagging
+                        // catalog advances) before retiring files it may still reference
+                        Path existingPath = pathFactory.toMetadataPath(snapshotId);
+                        Path basePath = pathFactory.toMetadataPath(snapshotId - 1);
+                        IcebergMetadata base =
+                                table.fileIO().exists(basePath)
+                                        ? IcebergMetadata.fromPath(table.fileIO(), basePath)
+                                        : null;
+                        commitToExternalCatalog(
+                                IcebergMetadata.fromPath(table.fileIO(), existingPath),
+                                existingPath,
+                                base,
+                                base == null ? null : basePath);
+                    }
+                    // a failed earlier attempt skipped the normal post-publication cleanup
+                    deleteApplicableMetadataFiles(snapshotId);
+                    retireAbandonedSuffix();
+                    table.fileIO()
+                            .deleteQuietly(
+                                    new Path(
+                                            pathFactory.metadataDirectory(),
+                                            RETIRE_PENDING_FILENAME));
+                    return;
+                }
+                // a reused snapshot id: only the current head may replace the abandoned
+                // metadata; a delayed replay must not move hint or pointer backwards
+                Long latestNow = table.snapshotManager().latestSnapshotId();
+                if (latestNow == null || latestNow != snapshotId) {
+                    return;
+                }
+                // read the identity now, delete only at the write site: readers and the
+                // catalog pointer keep a working file until the replacement is built
+                IcebergMetadata abandoned = tryReadMetadata(pathFactory.toMetadataPath(snapshotId));
+                if (abandoned != null) {
+                    abandonedUuid = abandoned.tableUuid();
+                    abandonedLastColumnId = abandoned.lastColumnId();
+                    if (abandoned.nextRowId() != null) {
+                        abandonedNextRowId = abandoned.nextRowId();
+                    }
+                }
+            }
+            // steady-state commits skip the listing; anything suspicious lists the actual
+            // files, because the hint alone can lag while readers still probe past it
+            Path retirePending = new Path(pathFactory.metadataDirectory(), RETIRE_PENDING_FILENAME);
+            boolean suspectRollback =
+                    abandonedUuid != null
+                            || readVersionHint() != snapshotId - 1
+                            || table.fileIO().exists(pathFactory.toMetadataPath(snapshotId + 1))
+                            || table.fileIO().exists(retirePending);
+            long newestExisting = suspectRollback ? newestExistingMetadataVersion() : -1;
+            boolean retireSuffix = abandonedUuid != null || newestExisting > snapshotId;
+            if (retireSuffix && newestExisting > snapshotId) {
+                // the newest abandoned version carries the authoritative high-water mark
+                IcebergMetadata surviving =
+                        tryReadMetadata(pathFactory.toMetadataPath(newestExisting));
+                if (surviving != null) {
+                    if (abandonedUuid == null) {
+                        abandonedUuid = surviving.tableUuid();
+                    }
+                    abandonedLastColumnId =
+                            Math.max(abandonedLastColumnId, surviving.lastColumnId());
+                    if (surviving.nextRowId() != null) {
+                        abandonedNextRowId = Math.max(abandonedNextRowId, surviving.nextRowId());
+                    }
+                }
+            }
+
+            Path baseMetadataPath = pathFactory.toMetadataPath(snapshotId - 1);
+
+            if (table.fileIO().exists(baseMetadataPath)) {
+                createMetadataWithBase(
+                        fileChangesCollector,
+                        indexFiles.stream()
+                                .filter(
+                                        index ->
+                                                index.indexFile()
+                                                        .indexType()
+                                                        .equals(DELETION_VECTORS_INDEX))
+                                .collect(Collectors.toList()),
+                        snapshot,
+                        baseMetadataPath,
+                        abandonedLastColumnId,
+                        abandonedNextRowId);
+            } else {
+                createMetadataWithoutBase(
+                        snapshotId, abandonedUuid, abandonedLastColumnId, abandonedNextRowId);
+            }
+
+            if (retireSuffix) {
+                // only after the replacement is durable, so readers keep a working head
+                retireAbandonedSuffix();
+            }
+            if (suspectRollback) {
+                // the listing ran and every leftover above the head is gone
+                table.fileIO().deleteQuietly(retirePending);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Create metadata afresh
+    // -------------------------------------------------------------------------------------
+
+    private void createMetadataWithoutBase(long snapshotId) throws IOException {
+        createMetadataWithoutBase(snapshotId, null, 0, 0L);
+    }
+
+    private void createMetadataWithoutBase(long snapshotId, @Nullable String inheritUuid)
+            throws IOException {
+        createMetadataWithoutBase(snapshotId, inheritUuid, 0, 0L);
+    }
+
+    private void createMetadataWithoutBase(
+            long snapshotId,
+            @Nullable String inheritUuid,
+            int lastColumnIdFloor,
+            long nextRowIdFloor)
+            throws IOException {
+        SnapshotReader snapshotReader = table.newSnapshotReader().withSnapshot(snapshotId);
+        Snapshot paimonSnapshot = table.snapshotManager().snapshot(snapshotId);
+        SchemaCache schemaCache = new SchemaCache();
+        List<IcebergManifestEntry> dataFileEntries = new ArrayList<>();
+        List<IcebergManifestEntry> dvFileEntries = new ArrayList<>();
+        SummaryMetrics metrics = new SummaryMetrics();
+        Set<BinaryRow> changedPartitions = new HashSet<>();
+
+        List<DataSplit> filteredDataSplits =
+                snapshotReader.read().dataSplits().stream()
+                        .filter(DataSplit::rawConvertible)
+                        .collect(Collectors.toList());
+        for (DataSplit dataSplit : filteredDataSplits) {
+            changedPartitions.add(dataSplit.partition());
+            dataSplitToManifestEntries(
+                    dataSplit, snapshotId, schemaCache, dataFileEntries, dvFileEntries);
+
+            for (DataFileMeta paimonFileMeta : dataSplit.dataFiles()) {
+                metrics.addedDataFiles++;
+                metrics.addedRecords += paimonFileMeta.rowCount();
+                metrics.addedFilesSize += paimonFileMeta.fileSize();
+            }
+        }
+
+        List<IcebergManifestFileMeta> dataManifestFileMetas = new ArrayList<>();
+        if (!dataFileEntries.isEmpty()) {
+            dataManifestFileMetas.addAll(
+                    manifestFile.rollingWrite(dataFileEntries.iterator(), snapshotId));
+        }
+
+        List<IcebergManifestFileMeta> dvManifestFileMetas = new ArrayList<>();
+        if (!dvFileEntries.isEmpty()) {
+            dvManifestFileMetas.addAll(
+                    manifestFile.rollingWrite(
+                            dvFileEntries.iterator(),
+                            snapshotId,
+                            IcebergManifestFileMeta.Content.DELETES));
+        }
+
+        List<IcebergManifestFileMeta> allManifestFileMetas = new ArrayList<>();
+        allManifestFileMetas.addAll(dataManifestFileMetas);
+        allManifestFileMetas.addAll(dvManifestFileMetas);
+
+        metrics.changedPartitionCount = changedPartitions.size();
+        metrics.totalDataFiles = metrics.addedDataFiles;
+        metrics.deletedDataFiles = 0;
+        metrics.deletedRecords = 0;
+        metrics.deletedFilesSize = 0;
+        metrics.totalRecords = metrics.addedRecords;
+        metrics.totalFilesSize = metrics.addedFilesSize;
+        long totalDeleteFiles = dvFileEntries.stream().filter(IcebergManifestEntry::isLive).count();
+        long totalPositionDeleteRecords =
+                dvFileEntries.stream()
+                        .filter(IcebergManifestEntry::isLive)
+                        .mapToLong(entry -> entry.file().recordCount())
+                        .sum();
+        metrics.totalDeleteFiles = totalDeleteFiles;
+        metrics.totalPositionDeletes = totalPositionDeleteRecords;
+        metrics.totalEqualityDeletes = 0;
+
+        // a rebuild replaces metadata whose ids are already out with readers: never reuse them
+        Long snapshotFirstRowId = computeSnapshotFirstRowId(nextRowIdFloor);
+        ManifestRowIdAssignment rowIdAssignment =
+                assignManifestFirstRowIds(allManifestFileMetas, snapshotFirstRowId);
+        allManifestFileMetas = rowIdAssignment.manifests;
+        Long addedRows = snapshotFirstRowId == null ? null : rowIdAssignment.assignedRows;
+        Long nextRowId =
+                snapshotFirstRowId == null
+                        ? null
+                        : snapshotFirstRowId + rowIdAssignment.assignedRows;
+        String manifestListFileName = manifestList.writeWithoutRolling(allManifestFileMetas);
+
+        // current schema follows the latest; the snapshot entry records its own schema
+        int schemaId = (int) schemaCache.getLatestSchemaId();
+        int snapshotSchemaId = (int) paimonSnapshot.schemaId();
+        IcebergSchema icebergSchema = schemaCache.get(schemaId);
+        List<IcebergPartitionField> partitionFields =
+                getPartitionFields(table.schema().partitionKeys(), icebergSchema);
+
+        IcebergSnapshotSummary snapshotSummary =
+                computeSnapshotSummary(
+                        IcebergSnapshotSummary.APPEND.operation(), paimonSnapshot, metrics);
+
+        IcebergSnapshot snapshot =
+                new IcebergSnapshot(
+                        snapshotId,
+                        snapshotId,
+                        snapshotId == Snapshot.FIRST_SNAPSHOT_ID ? null : (Long) (snapshotId - 1),
+                        // the Paimon snapshot's own commit time, the as-of time readers see
+                        paimonSnapshot.timeMillis(),
+                        snapshotSummary,
+                        pathFactory.toManifestListPath(manifestListFileName).toString(),
+                        snapshotSchemaId,
+                        snapshotFirstRowId,
+                        addedRows);
+
+        // Tags can only be included in Iceberg if they point to an Iceberg snapshot that
+        // exists. Otherwise, an Iceberg client fails to parse the metadata and all reads fail.
+        // Only the latest snapshot ID is added to Iceberg in this code path. Since this snapshot
+        // has just been committed to Paimon, it is not possible for any Paimon tag to reference it
+        // yet.
+        // After https://github.com/apache/paimon/issues/6107 we can add tags here.
+        Map<String, IcebergRef> refs = new HashMap<>();
+
+        // keep the identity of the metadata this rebuild replaces, so already loaded readers
+        // and external catalogs keep refreshing the same table
+        String tableUuid = inheritUuid != null ? inheritUuid : UUID.randomUUID().toString();
+
+        List<IcebergSchema> allSchemas =
+                IntStream.rangeClosed(0, schemaId)
+                        .mapToObj(schemaCache::get)
+                        .collect(Collectors.toList());
+        IcebergMetadata metadata =
+                new IcebergMetadata(
+                        formatVersion,
+                        tableUuid,
+                        table.location().toString(),
+                        snapshotId,
+                        // every emitted schema counts, and a rebuild must not regress
+                        // below the replaced metadata's high-water mark
+                        Math.max(
+                                lastColumnIdFloor,
+                                allSchemas.stream()
+                                        .mapToInt(IcebergSchema::highestFieldId)
+                                        .max()
+                                        .orElse(icebergSchema.highestFieldId())),
+                        allSchemas,
+                        schemaId,
+                        Collections.singletonList(new IcebergPartitionSpec(partitionFields)),
+                        partitionFields.stream()
+                                .mapToInt(IcebergPartitionField::fieldId)
+                                .max()
+                                .orElse(
+                                        // not sure why, this is a result tested by hand
+                                        IcebergPartitionField.FIRST_FIELD_ID - 1),
+                        Collections.singletonList(snapshot),
+                        (int) snapshotId,
+                        nextRowId,
+                        refs);
+
+        Path metadataPath = pathFactory.toMetadataPath(snapshotId);
+        // atomic-first: where rename overwrites, a stale twin is replaced with no window at
+        // all; otherwise fall back to delete-then-write, the smallest window available
+        boolean written = table.fileIO().tryToWriteAtomic(metadataPath, metadata.toJson());
+        if (!written
+                && table.fileIO().exists(metadataPath)
+                && !metadataMatchesSnapshot(snapshotId, paimonSnapshot)) {
+            table.fileIO().deleteQuietly(metadataPath);
+            written = table.fileIO().tryToWriteAtomic(metadataPath, metadata.toJson());
+        }
+        if (!written && !metadataMatchesSnapshot(snapshotId, paimonSnapshot)) {
+            // no twin published this snapshot's metadata; fail so the commit retries
+            throw new IllegalStateException(
+                    "Failed to replace Iceberg metadata "
+                            + metadataPath
+                            + " for table "
+                            + table.name());
+        }
+        // a delayed callback may still write its metadata (a newer commit extends it), but
+        // only the current head may move the hint and the external catalog
+        Long latestAtPublish = table.snapshotManager().latestSnapshotId();
+        if (latestAtPublish != null && latestAtPublish == snapshotId) {
+            table.fileIO()
+                    .overwriteFileUtf8(
+                            new Path(pathFactory.metadataDirectory(), VERSION_HINT_FILENAME),
+                            String.valueOf(snapshotId));
+            commitToExternalCatalog(metadata, metadataPath, null, null);
+            // cleanup only after the catalog serves the new head: a skipped or failed
+            // publication must not delete files an external pointer still references
+            expireAllBefore(snapshotId);
+        }
+    }
+
+    private void dataSplitToManifestEntries(
+            DataSplit dataSplit,
+            long snapshotId,
+            SchemaCache schemaCache,
+            List<IcebergManifestEntry> dataFileEntries,
+            List<IcebergManifestEntry> dvFileEntries) {
+        List<RawFile> rawFiles = dataSplit.convertToRawFiles().get();
+
+        for (int i = 0; i < dataSplit.dataFiles().size(); i++) {
+            DataFileMeta paimonFileMeta = dataSplit.dataFiles().get(i);
+            RawFile rawFile = rawFiles.get(i);
+            IcebergDataFileMeta fileMeta =
+                    IcebergDataFileMeta.create(
+                            IcebergDataFileMeta.Content.DATA,
+                            rawFile.path(),
+                            rawFile.format(),
+                            dataSplit.partition(),
+                            rawFile.rowCount(),
+                            rawFile.fileSize(),
+                            schemaCache.get(paimonFileMeta.schemaId()),
+                            paimonFileMeta.valueStats(),
+                            paimonFileMeta.valueStatsCols());
+            dataFileEntries.add(
+                    new IcebergManifestEntry(
+                            IcebergManifestEntry.Status.ADDED,
+                            snapshotId,
+                            snapshotId,
+                            snapshotId,
+                            fileMeta));
+
+            if (needAddDvToIceberg
+                    && dataSplit.deletionFiles().isPresent()
+                    && dataSplit.deletionFiles().get().get(i) != null) {
+                DeletionFile deletionFile = dataSplit.deletionFiles().get().get(i);
+
+                // Iceberg will check the cardinality between deserialized dv and iceberg deletion
+                // file, so if deletionFile.cardinality() is null, we should stop synchronizing all
+                // dvs.
+                Preconditions.checkState(
+                        deletionFile.cardinality() != null,
+                        "cardinality in DeletionFile is null, stop generating dv for iceberg. "
+                                + "dataFile path is {}, deletionFile is {}",
+                        rawFile.path(),
+                        deletionFile);
+
+                // We can not get the file size of the complete DV index file from the DeletionFile,
+                // so we set 'fileSizeInBytes' to -1(default in iceberg)
+                IcebergDataFileMeta deleteFileMeta =
+                        IcebergDataFileMeta.createForDeleteFile(
+                                IcebergDataFileMeta.Content.POSITION_DELETES,
+                                deletionFile.path(),
+                                PUFFIN_FORMAT,
+                                dataSplit.partition(),
+                                deletionFile.cardinality(),
+                                -1,
+                                rawFile.path(),
+                                deletionFile.offset(),
+                                deletionFile.length());
+
+                dvFileEntries.add(
+                        new IcebergManifestEntry(
+                                IcebergManifestEntry.Status.ADDED,
+                                snapshotId,
+                                snapshotId,
+                                snapshotId,
+                                deleteFileMeta));
+            }
+        }
+    }
+
+    private List<IcebergPartitionField> getPartitionFields(
+            List<String> partitionKeys, IcebergSchema icebergSchema) {
+        Map<String, IcebergDataField> fields = new HashMap<>();
+        for (IcebergDataField field : icebergSchema.fields()) {
+            fields.put(field.name(), field);
+        }
+
+        List<IcebergPartitionField> result = new ArrayList<>();
+        int fieldId = IcebergPartitionField.FIRST_FIELD_ID;
+        for (String partitionKey : partitionKeys) {
+            result.add(new IcebergPartitionField(fields.get(partitionKey), fieldId));
+            fieldId++;
+        }
+        return result;
+    }
+
+    /** VARIANT is an Iceberg format-version-3 type; reject publishing it into v2 metadata. */
+    static void checkVariantNotPublishable(RowType rowType) {
+        Collection<String> variantFields = new LinkedHashSet<>();
+        for (DataField field : rowType.getFields()) {
+            collectVariantFields(field.name(), field.type(), variantFields);
+        }
+        Preconditions.checkArgument(
+                variantFields.isEmpty(),
+                "Columns %s use the VARIANT type, which requires Iceberg format version 3. "
+                        + "Set 'metadata.iceberg.format-version' = '3' to publish this table.",
+                variantFields);
+    }
+
+    private static void collectVariantFields(
+            String path, DataType type, Collection<String> variantFields) {
+        switch (type.getTypeRoot()) {
+            case VARIANT:
+                variantFields.add(path + ": " + type.asSQLString());
+                break;
+            case ARRAY:
+                collectVariantFields(
+                        path + ".element", ((ArrayType) type).getElementType(), variantFields);
+                break;
+            case MULTISET:
+                collectVariantFields(
+                        path + ".element", ((MultisetType) type).getElementType(), variantFields);
+                break;
+            case MAP:
+                collectVariantFields(path + ".key", ((MapType) type).getKeyType(), variantFields);
+                collectVariantFields(
+                        path + ".value", ((MapType) type).getValueType(), variantFields);
+                break;
+            case ROW:
+                for (DataField field : ((RowType) type).getFields()) {
+                    collectVariantFields(path + "." + field.name(), field.type(), variantFields);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Create metadata based on old ones
+    // -------------------------------------------------------------------------------------
+
+    /**
+     * Whether the existing metadata for {@code snapshotId} was built from this very Paimon
+     * snapshot, judged by the commit identity in the snapshot summary. Unreadable counts as a
+     * mismatch; metadata without an identity (older releases) is trusted, so the protection only
+     * covers metadata written since.
+     *
+     * <p>A replacement reuses its metadata version (versions are keyed by Paimon snapshot id), so
+     * readers that already loaded the abandoned version converge only after reloading the table.
+     */
+    /**
+     * Deletes every metadata version above the current Paimon snapshots, which would otherwise
+     * shadow the replaced timeline for readers probing past the hint. A failed deletion fails the
+     * commit so a retry finishes the job; referenced manifests are left to orphan cleanup (the
+     * shared prefix makes reference counting non-trivial).
+     */
+    private void retireAbandonedSuffix() throws IOException {
+        for (FileStatus status : table.fileIO().listStatus(pathFactory.metadataDirectory())) {
+            String name = status.getPath().getName();
+            if (!name.startsWith("v") || !name.endsWith(".metadata.json")) {
+                continue;
+            }
+            long version;
+            try {
+                version = Long.parseLong(name.substring(1, name.indexOf('.')));
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            Long latestNow = table.snapshotManager().latestSnapshotId();
+            if (latestNow == null || version <= latestNow) {
+                continue;
+            }
+            table.fileIO().deleteQuietly(status.getPath());
+            if (table.fileIO().exists(status.getPath())) {
+                throw new IllegalStateException(
+                        "Failed to retire abandoned Iceberg metadata " + status.getPath());
+            }
+        }
+    }
+
+    static final String RETIRE_PENDING_FILENAME = "retire-pending";
+
+    /**
+     * Marks that a rollback may have left abandoned metadata behind; written before the rollback
+     * deletes anything, and cleared once a commit has listed and retired the leftovers.
+     */
+    public static void markRetirePendingForRollback(FileStoreTable table) {
+        if (table.coreOptions().toConfiguration().get(IcebergOptions.METADATA_ICEBERG_STORAGE)
+                == IcebergOptions.StorageType.DISABLED) {
+            return;
+        }
+        try {
+            Path dir = catalogTableMetadataPath(table);
+            if (table.fileIO().exists(dir)) {
+                table.fileIO().overwriteFileUtf8(new Path(dir, RETIRE_PENDING_FILENAME), "");
+            }
+        } catch (Exception e) {
+            // best-effort: the commit-time suspicion gate still covers the common cases
+        }
+    }
+
+    /** The version recorded in the hint file, or -1 when absent or unreadable. */
+    private long readVersionHint() {
+        try {
+            return Long.parseLong(
+                    table.fileIO()
+                            .readFileUtf8(
+                                    new Path(
+                                            pathFactory.metadataDirectory(), VERSION_HINT_FILENAME))
+                            .trim());
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private void commitToExternalCatalog(
+            IcebergMetadata metadata,
+            Path metadataPath,
+            @Nullable IcebergMetadata baseMetadata,
+            @Nullable Path baseMetadataPath) {
+        if (metadataCommitter == null) {
+            return;
+        }
+        switch (metadataCommitter.identifier()) {
+            case "hive":
+                metadataCommitter.commitMetadata(metadataPath, baseMetadataPath);
+                break;
+            case "rest":
+                metadataCommitter.commitMetadata(metadata, baseMetadata);
+                break;
+            default:
+                throw new UnsupportedOperationException(
+                        "Unsupported metadata committer: " + metadataCommitter.identifier());
+        }
+    }
+
+    /** The newest existing metadata file version, or -1 when there is none. */
+    private long newestExistingMetadataVersion() throws IOException {
+        FileStatus[] statuses;
+        try {
+            statuses = table.fileIO().listStatus(pathFactory.metadataDirectory());
+        } catch (FileNotFoundException e) {
+            // only a missing directory counts as empty; a transient listing failure must
+            // fail the commit, or a stale suffix would silently survive
+            return -1;
+        }
+        long newest = -1;
+        for (FileStatus status : statuses) {
+            String name = status.getPath().getName();
+            if (!name.startsWith("v") || !name.endsWith(".metadata.json")) {
+                continue;
+            }
+            try {
+                newest = Math.max(newest, Long.parseLong(name.substring(1, name.indexOf('.'))));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return newest;
+    }
+
+    /** The given metadata file, or null when unreadable. */
+    @Nullable
+    private IcebergMetadata tryReadMetadata(Path metadataPath) {
+        try {
+            return IcebergMetadata.fromPath(table.fileIO(), metadataPath);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean metadataMatchesSnapshot(long snapshotId, Snapshot snapshot) {
+        try {
+            IcebergMetadata existing =
+                    IcebergMetadata.fromPath(
+                            table.fileIO(), pathFactory.toMetadataPath(snapshotId));
+            return metadataMatchesSnapshot(existing, snapshot);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean metadataMatchesSnapshot(IcebergMetadata metadata, Snapshot snapshot) {
+        if (metadata.currentSnapshot() == null) {
+            return false;
+        }
+        String identity =
+                metadata.currentSnapshot().summary().get(SNAPSHOT_SUMMARY_PAIMON_COMMIT_IDENTITY);
+        return identity == null || identity.equals(commitIdentity(snapshot));
+    }
+
+    private void createMetadataWithBase(
+            FileChangesCollector fileChangesCollector,
+            List<IndexManifestEntry> indexFiles,
+            Snapshot snapshot,
+            Path baseMetadataPath,
+            int lastColumnIdFloor,
+            long nextRowIdFloor)
+            throws IOException {
+        long snapshotId = snapshot.id();
+        IcebergMetadata baseMetadata = IcebergMetadata.fromPath(table.fileIO(), baseMetadataPath);
+        // row ids handed out by the base or by abandoned metadata must never be reused
+        long rowIdFloor =
+                Math.max(
+                        nextRowIdFloor,
+                        baseMetadata.nextRowId() == null ? 0L : baseMetadata.nextRowId());
+
+        // a base left on the abandoned timeline must be rebuilt, not extended
+        if (table.snapshotManager().snapshotExists(snapshotId - 1)
+                && !metadataMatchesSnapshot(
+                        baseMetadata, table.snapshotManager().snapshot(snapshotId - 1))) {
+            Long latestNow = table.snapshotManager().latestSnapshotId();
+            if (latestNow == null || latestNow != snapshotId) {
+                // a delayed replay on the abandoned timeline: leave publication to the head
+                return;
+            }
+            // keep the stale base's identity so external catalogs do not recreate the table
+            createMetadataWithoutBase(
+                    snapshotId,
+                    baseMetadata.tableUuid(),
+                    Math.max(lastColumnIdFloor, baseMetadata.lastColumnId()),
+                    rowIdFloor);
+            return;
+        }
+
+        if (!isSameFormatVersion(baseMetadata.formatVersion())) {
+            // we need to recreate iceberg metadata if format version changed
+            createMetadataWithoutBase(
+                    snapshot.id(),
+                    null,
+                    Math.max(lastColumnIdFloor, baseMetadata.lastColumnId()),
+                    rowIdFloor);
+            return;
+        }
+
+        if (formatVersion == IcebergMetadata.FORMAT_VERSION_V3
+                && baseMetadata.nextRowId() == null) {
+            // v3 base metadata written before Paimon emitted row lineage; recreate to self-heal
+            createMetadataWithoutBase(
+                    snapshot.id(),
+                    baseMetadata.tableUuid(),
+                    Math.max(lastColumnIdFloor, baseMetadata.lastColumnId()),
+                    rowIdFloor);
+            return;
+        }
+
+        // decide the schema story before any manifest is written
+        SchemaCache schemaCache = new SchemaCache();
+        int schemaId = (int) schemaCache.getLatestSchemaId();
+        int snapshotSchemaId = (int) snapshot.schemaId();
+        IcebergSchema icebergSchema = schemaCache.get(schemaId);
+        // re-verified each commit: a rollback re-evolution can redefine an already
+        // verified id while this callback only ever sees increasing snapshot ids
+        for (IcebergSchema known : baseMetadata.schemas()) {
+            if (known.schemaId() > schemaId) {
+                continue;
+            }
+            IcebergSchema current =
+                    known.schemaId() == schemaId
+                            ? icebergSchema
+                            : schemaCache.get(known.schemaId());
+            if (!known.equals(current)) {
+                // a re-evolution reused this id with different fields; rebuild from scratch
+                createMetadataWithoutBase(
+                        snapshot.id(),
+                        baseMetadata.tableUuid(),
+                        Math.max(lastColumnIdFloor, baseMetadata.lastColumnId()),
+                        rowIdFloor);
+                return;
+            }
+        }
+        if (schemaId < baseMetadata.currentSchemaId()) {
+            // pointer-only schema rollback keeps the base; an abandoned-timeline base
+            // (snapshot entry mismatching the live snapshot) is rebuilt
+            IcebergSnapshot baseCurrent = baseMetadata.currentSnapshot();
+            SnapshotManager snapshotManager = table.snapshotManager();
+            boolean pointerRollbackOnly =
+                    baseCurrent != null
+                            && snapshotManager.snapshotExists(snapshotId - 1)
+                            && baseCurrent.schemaId()
+                                    == (int) snapshotManager.snapshot(snapshotId - 1).schemaId();
+            if (!pointerRollbackOnly) {
+                createMetadataWithoutBase(
+                        snapshot.id(),
+                        baseMetadata.tableUuid(),
+                        Math.max(lastColumnIdFloor, baseMetadata.lastColumnId()),
+                        rowIdFloor);
+                return;
+            }
+        }
+
+        List<IcebergManifestFileMeta> baseManifestFileMetas =
+                manifestList.read(baseMetadata.currentSnapshot().manifestList());
+
+        // base manifest file for data files
+        List<IcebergManifestFileMeta> baseDataManifestFileMetas =
+                baseManifestFileMetas.stream()
+                        .filter(meta -> meta.content() == IcebergManifestFileMeta.Content.DATA)
+                        .collect(Collectors.toList());
+
+        // base manifest file for deletion vector index files
+        List<IcebergManifestFileMeta> baseDVManifestFileMetas =
+                baseManifestFileMetas.stream()
+                        .filter(meta -> meta.content() == IcebergManifestFileMeta.Content.DELETES)
+                        .collect(Collectors.toList());
+
+        Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles = new LinkedHashMap<>();
+        Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles = new LinkedHashMap<>();
+        boolean isAddOnly = fileChangesCollector.collect(removedFiles, addedFiles);
+        Set<BinaryRow> modifiedPartitionsSet =
+                removedFiles.values().stream()
+                        .map(Pair::getLeft)
+                        .collect(Collectors.toCollection(LinkedHashSet::new));
+        addedFiles.values().stream().map(Pair::getLeft).forEach(modifiedPartitionsSet::add);
+        List<BinaryRow> modifiedPartitions = new ArrayList<>(modifiedPartitionsSet);
+
+        // Note that this check may be different from `removedFiles.isEmpty()`,
+        // because if a file's level is changed, it will first be removed and then added.
+        // In this case, if `baseMetadata` already contains this file, we should not add a
+        // duplicate.
+        List<IcebergManifestFileMeta> newDataManifestFileMetas;
+        String operation;
+        if (isAddOnly) {
+            // Fast case. We don't need to remove files from `baseMetadata`. We only need to append
+            // new metadata files.
+            newDataManifestFileMetas = new ArrayList<>(baseDataManifestFileMetas);
+            newDataManifestFileMetas.addAll(
+                    createNewlyAddedManifestFileMetas(addedFiles, snapshotId));
+            operation = IcebergSnapshotSummary.APPEND.operation();
+        } else {
+            Pair<List<IcebergManifestFileMeta>, String> result =
+                    createWithDeleteManifestFileMetas(
+                            removedFiles,
+                            addedFiles,
+                            modifiedPartitions,
+                            baseDataManifestFileMetas,
+                            snapshotId,
+                            snapshot.commitKind());
+            newDataManifestFileMetas = result.getLeft();
+            operation = result.getRight();
+        }
+
+        List<IcebergManifestFileMeta> newDVManifestFileMetas = new ArrayList<>();
+        if (needAddDvToIceberg) {
+            if (!indexFiles.isEmpty()) {
+                // reconstruct the dv index
+                newDVManifestFileMetas.addAll(createDvManifestFileMetas(snapshot));
+            } else {
+                // no new dv index, reuse the old one
+                newDVManifestFileMetas.addAll(baseDVManifestFileMetas);
+            }
+        }
+
+        // compact data manifest file if needed
+        newDataManifestFileMetas = compactMetadataIfNeeded(newDataManifestFileMetas, snapshotId);
+
+        SummaryMetrics metrics = new SummaryMetrics();
+        metrics.addedDataFiles = addedFiles.size();
+        metrics.addedRecords =
+                addedFiles.values().stream().mapToLong(p -> p.getRight().rowCount()).sum();
+        metrics.addedFilesSize =
+                addedFiles.values().stream().mapToLong(p -> p.getRight().fileSize()).sum();
+        metrics.deletedDataFiles = removedFiles.size();
+        metrics.deletedRecords =
+                removedFiles.values().stream().mapToLong(p -> p.getRight().rowCount()).sum();
+        metrics.deletedFilesSize =
+                removedFiles.values().stream().mapToLong(p -> p.getRight().fileSize()).sum();
+        metrics.changedPartitionCount = modifiedPartitionsSet.size();
+
+        IcebergSnapshot baseSnapshot = baseMetadata.currentSnapshot();
+
+        Long previousTotalRecordsValue =
+                getSummaryLong(baseSnapshot, SNAPSHOT_SUMMARY_TOTAL_RECORDS);
+        long previousTotalRecords =
+                previousTotalRecordsValue != null
+                        ? previousTotalRecordsValue
+                        : computeLiveRowCount(baseDataManifestFileMetas);
+        metrics.totalRecords =
+                Math.max(0, previousTotalRecords + metrics.addedRecords - metrics.deletedRecords);
+
+        Long previousTotalDataFilesValue =
+                getSummaryLong(baseSnapshot, SNAPSHOT_SUMMARY_TOTAL_DATA_FILES);
+        long previousTotalDataFiles =
+                previousTotalDataFilesValue != null
+                        ? previousTotalDataFilesValue
+                        : computeLiveFileCount(baseDataManifestFileMetas);
+        metrics.totalDataFiles =
+                Math.max(
+                        0,
+                        previousTotalDataFiles + metrics.addedDataFiles - metrics.deletedDataFiles);
+
+        Long previousTotalFilesSizeValue =
+                getSummaryLong(baseSnapshot, SNAPSHOT_SUMMARY_TOTAL_FILES_SIZE);
+        long previousTotalFilesSize =
+                previousTotalFilesSizeValue != null
+                        ? previousTotalFilesSizeValue
+                        : computeTotalFilesSizeFromManifests(baseDataManifestFileMetas);
+        metrics.totalFilesSize =
+                Math.max(
+                        0,
+                        previousTotalFilesSize + metrics.addedFilesSize - metrics.deletedFilesSize);
+
+        metrics.totalDeleteFiles = computeLiveFileCount(newDVManifestFileMetas);
+        metrics.totalPositionDeletes = computeLiveRowCount(newDVManifestFileMetas);
+        metrics.totalEqualityDeletes = 0;
+
+        Long snapshotFirstRowId = computeSnapshotFirstRowId(rowIdFloor);
+
+        ManifestRowIdAssignment rowIdAssignment =
+                assignManifestFirstRowIds(
+                        Stream.concat(
+                                        newDataManifestFileMetas.stream(),
+                                        newDVManifestFileMetas.stream())
+                                .collect(Collectors.toList()),
+                        snapshotFirstRowId);
+        List<IcebergManifestFileMeta> newManifestFileMetasWithRowIds = rowIdAssignment.manifests;
+        Long addedRows = snapshotFirstRowId == null ? null : rowIdAssignment.assignedRows;
+        Long nextRowId =
+                snapshotFirstRowId == null
+                        ? null
+                        : snapshotFirstRowId + rowIdAssignment.assignedRows;
+        String manifestListFileName =
+                manifestList.writeWithoutRolling(newManifestFileMetasWithRowIds);
+
+        IcebergSnapshotSummary snapshotSummary =
+                computeSnapshotSummary(operation, snapshot, metrics);
+
+        // add new schemas if needed
+        List<IcebergSchema> schemas = baseMetadata.schemas();
+        if (schemaId > baseMetadata.currentSchemaId()) {
+            // append only ids the list does not already carry
+            Set<Integer> knownSchemaIds =
+                    schemas.stream().map(IcebergSchema::schemaId).collect(Collectors.toSet());
+            schemas = new ArrayList<>(schemas);
+            schemas.addAll(
+                    IntStream.rangeClosed(baseMetadata.currentSchemaId() + 1, schemaId)
+                            .filter(id -> !knownSchemaIds.contains(id))
+                            .mapToObj(schemaCache::get)
+                            .collect(Collectors.toList()));
+        }
+        // a schema-pointer rollback (validated above): only the current pointer moves
+
+        List<IcebergSnapshot> snapshots = new ArrayList<>(baseMetadata.snapshots());
+        snapshots.add(
+                new IcebergSnapshot(
+                        snapshotId,
+                        snapshotId,
+                        snapshotId - 1,
+                        // the Paimon snapshot's own commit time, the as-of time readers see
+                        snapshot.timeMillis(),
+                        snapshotSummary,
+                        pathFactory.toManifestListPath(manifestListFileName).toString(),
+                        // the snapshot's own schema, for time travel
+                        snapshotSchemaId,
+                        snapshotFirstRowId,
+                        addedRows));
+
+        // all snapshots in this list, except the last one, need to expire
+        List<IcebergSnapshot> toExpireExceptLast = new ArrayList<>();
+        for (int i = 0; i + 1 < snapshots.size(); i++) {
+            toExpireExceptLast.add(snapshots.get(i));
+            // commit callback is called before expire, so we cannot use current earliest snapshot
+            // and have to check expire condition by ourselves
+            if (!shouldExpire(snapshots.get(i), snapshotId)) {
+                snapshots = snapshots.subList(i, snapshots.size());
+                break;
+            }
+        }
+
+        // Tags can only be included in Iceberg if they point to an Iceberg snapshot that
+        // exists. Otherwise an Iceberg client fails to parse the metadata and all reads fail.
+        Set<Long> snapshotIds =
+                snapshots.stream().map(IcebergSnapshot::snapshotId).collect(Collectors.toSet());
+        Map<String, IcebergRef> refs =
+                table.tagManager().tags().entrySet().stream()
+                        .filter(entry -> snapshotIds.contains(entry.getKey().id()))
+                        .collect(
+                                Collectors.toMap(
+                                        entry -> entry.getValue().get(0),
+                                        entry -> new IcebergRef(entry.getKey().id())));
+
+        IcebergMetadata metadata =
+                new IcebergMetadata(
+                        baseMetadata.formatVersion(),
+                        baseMetadata.tableUuid(),
+                        baseMetadata.location(),
+                        snapshotId,
+                        // must not regress when the current schema is older than the base's
+                        // never below what the replaced metadata already handed out
+                        Math.max(
+                                lastColumnIdFloor,
+                                Math.max(
+                                        baseMetadata.lastColumnId(),
+                                        icebergSchema.highestFieldId())),
+                        schemas,
+                        schemaId,
+                        baseMetadata.partitionSpecs(),
+                        baseMetadata.lastPartitionId(),
+                        snapshots,
+                        (int) snapshotId,
+                        nextRowId,
+                        refs);
+
+        Path metadataPath = pathFactory.toMetadataPath(snapshotId);
+        // atomic-first: see the no-base path
+        boolean written = table.fileIO().tryToWriteAtomic(metadataPath, metadata.toJson());
+        if (!written
+                && table.fileIO().exists(metadataPath)
+                && !metadataMatchesSnapshot(snapshotId, snapshot)) {
+            table.fileIO().deleteQuietly(metadataPath);
+            written = table.fileIO().tryToWriteAtomic(metadataPath, metadata.toJson());
+        }
+        if (!written && !metadataMatchesSnapshot(snapshotId, snapshot)) {
+            // no twin published this snapshot's metadata; fail so the commit retries
+            throw new IllegalStateException(
+                    "Failed to replace Iceberg metadata "
+                            + metadataPath
+                            + " for table "
+                            + table.name());
+        }
+        // a delayed callback may still write its metadata (a newer commit extends it), but
+        // only the current head may move the hint and the external catalog
+        Long latestAtPublish = table.snapshotManager().latestSnapshotId();
+        if (latestAtPublish != null && latestAtPublish == snapshotId) {
+            table.fileIO()
+                    .overwriteFileUtf8(
+                            new Path(pathFactory.metadataDirectory(), VERSION_HINT_FILENAME),
+                            String.valueOf(snapshotId));
+            commitToExternalCatalog(metadata, metadataPath, baseMetadata, baseMetadataPath);
+            // cleanup only after the catalog serves the new head: a skipped or failed
+            // publication must not delete files an external pointer still references
+            deleteApplicableMetadataFiles(snapshotId);
+            for (int i = 0; i + 1 < toExpireExceptLast.size(); i++) {
+                expireManifestList(
+                        new Path(toExpireExceptLast.get(i).manifestList()).getName(),
+                        new Path(toExpireExceptLast.get(i + 1).manifestList()).getName());
+            }
+        }
+    }
+
+    private interface FileChangesCollector {
+        boolean collect(
+                Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles,
+                Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles)
+                throws IOException;
+    }
+
+    private boolean collectFileChanges(
+            List<ManifestEntry> manifestEntries,
+            Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles,
+            Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles) {
+        boolean isAddOnly = true;
+        DataFilePathFactories factories = new DataFilePathFactories(fileStorePathFactory);
+        for (ManifestEntry entry : manifestEntries) {
+            DataFilePathFactory dataFilePathFactory =
+                    factories.get(entry.partition(), entry.bucket());
+            String path = dataFilePathFactory.toPath(entry).toString();
+            switch (entry.kind()) {
+                case ADD:
+                    if (shouldAddFileToIceberg(entry.file())) {
+                        removedFiles.remove(path);
+                        addedFiles.put(path, Pair.of(entry.partition(), entry.file()));
+                    }
+                    break;
+                case DELETE:
+                    isAddOnly = false;
+                    addedFiles.remove(path);
+                    removedFiles.put(path, Pair.of(entry.partition(), entry.file()));
+                    break;
+                default:
+                    throw new UnsupportedOperationException(
+                            "Unknown ManifestEntry FileKind " + entry.kind());
+            }
+        }
+        return isAddOnly;
+    }
+
+    private boolean collectFileChanges(
+            long snapshotId,
+            Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles,
+            Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles) {
+        return collectFileChanges(
+                table.store()
+                        .newScan()
+                        .withKind(ScanMode.DELTA)
+                        .withSnapshot(snapshotId)
+                        .plan()
+                        .files(),
+                removedFiles,
+                addedFiles);
+    }
+
+    private boolean shouldAddFileToIceberg(DataFileMeta meta) {
+        if (table.primaryKeys().isEmpty()) {
+            return true;
+        } else {
+            if (needAddDvToIceberg) {
+                return meta.level() > 0;
+            }
+            int maxLevel = table.coreOptions().numLevels() - 1;
+            return meta.level() == maxLevel;
+        }
+    }
+
+    private List<IcebergManifestFileMeta> createNewlyAddedManifestFileMetas(
+            Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles, long currentSnapshotId)
+            throws IOException {
+        if (addedFiles.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        SchemaCache schemaCache = new SchemaCache();
+        return manifestFile.rollingWrite(
+                addedFiles.entrySet().stream()
+                        .map(
+                                e -> {
+                                    DataFileMeta paimonFileMeta = e.getValue().getRight();
+                                    IcebergDataFileMeta icebergFileMeta =
+                                            IcebergDataFileMeta.create(
+                                                    IcebergDataFileMeta.Content.DATA,
+                                                    e.getKey(),
+                                                    paimonFileMeta.fileFormat(),
+                                                    e.getValue().getLeft(),
+                                                    paimonFileMeta.rowCount(),
+                                                    paimonFileMeta.fileSize(),
+                                                    schemaCache.get(paimonFileMeta.schemaId()),
+                                                    paimonFileMeta.valueStats(),
+                                                    paimonFileMeta.valueStatsCols());
+                                    return new IcebergManifestEntry(
+                                            IcebergManifestEntry.Status.ADDED,
+                                            currentSnapshotId,
+                                            currentSnapshotId,
+                                            currentSnapshotId,
+                                            icebergFileMeta);
+                                })
+                        .iterator(),
+                currentSnapshotId);
+    }
+
+    private Pair<List<IcebergManifestFileMeta>, String> createWithDeleteManifestFileMetas(
+            Map<String, Pair<BinaryRow, DataFileMeta>> removedFiles,
+            Map<String, Pair<BinaryRow, DataFileMeta>> addedFiles,
+            List<BinaryRow> modifiedPartitions,
+            List<IcebergManifestFileMeta> baseManifestFileMetas,
+            long currentSnapshotId,
+            Snapshot.CommitKind commitKind)
+            throws IOException {
+        String operation = IcebergSnapshotSummary.APPEND.operation();
+        List<IcebergManifestFileMeta> newManifestFileMetas = new ArrayList<>();
+
+        RowType partitionType = table.schema().logicalPartitionType();
+        PartitionPredicate predicate =
+                PartitionPredicate.fromMultiple(partitionType, modifiedPartitions);
+
+        for (IcebergManifestFileMeta fileMeta : baseManifestFileMetas) {
+            // use partition predicate to only check modified partitions
+            int numFields = partitionType.getFieldCount();
+            GenericRow minValues = new GenericRow(numFields);
+            GenericRow maxValues = new GenericRow(numFields);
+            long[] nullCounts = new long[numFields];
+            for (int i = 0; i < numFields; i++) {
+                IcebergPartitionSummary summary = fileMeta.partitions().get(i);
+                DataType fieldType = partitionType.getTypeAt(i);
+                // an omitted bound means the value is unknown; keep the slot null
+                byte[] lowerBound = summary.lowerBound();
+                byte[] upperBound = summary.upperBound();
+                if (lowerBound != null) {
+                    minValues.setField(i, IcebergConversions.toPaimonObject(fieldType, lowerBound));
+                }
+                if (upperBound != null) {
+                    maxValues.setField(i, IcebergConversions.toPaimonObject(fieldType, upperBound));
+                }
+                // IcebergPartitionSummary only has `containsNull` field and does not have the
+                // exact number of nulls.
+                nullCounts[i] = summary.containsNull() ? 1 : 0;
+            }
+
+            if (predicate == null
+                    || predicate.test(
+                            fileMeta.liveRowsCount(),
+                            minValues,
+                            maxValues,
+                            new GenericArray(nullCounts))) {
+                // check if any IcebergManifestEntry in this manifest file meta is removed
+                List<IcebergManifestEntry> entries =
+                        manifestFile.read(new Path(fileMeta.manifestPath()).getName());
+                boolean canReuseFile = true;
+                for (IcebergManifestEntry entry : entries) {
+                    if (entry.isLive()) {
+                        String path = entry.file().filePath();
+                        if (addedFiles.containsKey(path)) {
+                            // added file already exists (most probably due to level changes),
+                            // remove it to not add a duplicate.
+                            addedFiles.remove(path);
+                        } else if (removedFiles.containsKey(path)) {
+                            canReuseFile = false;
+                        }
+                    }
+                }
+
+                if (canReuseFile) {
+                    // nothing is removed, use this file meta again
+                    newManifestFileMetas.add(fileMeta);
+                } else {
+                    // some file is removed, rewrite this file meta
+                    operation =
+                            commitKind == Snapshot.CommitKind.COMPACT
+                                    ? IcebergSnapshotSummary.REPLACE.operation()
+                                    : IcebergSnapshotSummary.OVERWRITE.operation();
+                    List<IcebergManifestEntry> sourceEntries =
+                            materializeFirstRowIds(fileMeta, entries);
+                    List<IcebergManifestEntry> newEntries = new ArrayList<>();
+                    for (IcebergManifestEntry entry : sourceEntries) {
+                        if (entry.isLive()) {
+                            boolean removed = removedFiles.containsKey(entry.file().filePath());
+                            newEntries.add(
+                                    new IcebergManifestEntry(
+                                            removed
+                                                    ? IcebergManifestEntry.Status.DELETED
+                                                    : IcebergManifestEntry.Status.EXISTING,
+                                            // a deleted entry records the snapshot that
+                                            // deleted the file, not the one that added it
+                                            removed ? currentSnapshotId : entry.snapshotId(),
+                                            entry.sequenceNumber(),
+                                            entry.fileSequenceNumber(),
+                                            entry.file()));
+                        }
+                    }
+                    newManifestFileMetas.addAll(
+                            manifestFile.rollingWrite(newEntries.iterator(), currentSnapshotId));
+                }
+            } else {
+                // partition of this file meta is not modified in this snapshot,
+                // use this file meta again
+                newManifestFileMetas.add(fileMeta);
+            }
+        }
+
+        newManifestFileMetas.addAll(
+                createNewlyAddedManifestFileMetas(addedFiles, currentSnapshotId));
+        return Pair.of(newManifestFileMetas, operation);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Compact
+    // -------------------------------------------------------------------------------------
+
+    private List<IcebergManifestFileMeta> compactMetadataIfNeeded(
+            List<IcebergManifestFileMeta> toCompact, long currentSnapshotId) throws IOException {
+        List<IcebergManifestFileMeta> result = new ArrayList<>();
+        long targetSizeInBytes = table.coreOptions().manifestTargetSize().getBytes();
+
+        List<IcebergManifestFileMeta> candidates = new ArrayList<>();
+        long totalSizeInBytes = 0;
+        for (IcebergManifestFileMeta meta : toCompact) {
+            if (meta.manifestLength() < targetSizeInBytes * 2 / 3) {
+                candidates.add(meta);
+                totalSizeInBytes += meta.manifestLength();
+            } else {
+                result.add(meta);
+            }
+        }
+
+        Options options = new Options(table.options());
+        if (candidates.size() < options.get(IcebergOptions.COMPACT_MIN_FILE_NUM)) {
+            return toCompact;
+        }
+        if (candidates.size() < options.get(IcebergOptions.COMPACT_MAX_FILE_NUM)
+                && totalSizeInBytes < targetSizeInBytes) {
+            return toCompact;
+        }
+
+        Function<IcebergManifestFileMeta, List<IcebergManifestEntry>> processor =
+                meta -> {
+                    List<IcebergManifestEntry> sourceEntries =
+                            materializeFirstRowIds(
+                                    meta,
+                                    IcebergManifestFile.create(table, pathFactory)
+                                            .read(new Path(meta.manifestPath()).getName()));
+                    List<IcebergManifestEntry> entries = new ArrayList<>();
+                    for (IcebergManifestEntry entry : sourceEntries) {
+                        // a deletion made by this commit is recorded against the current
+                        // snapshot but keeps the file sequence number of the older snapshot
+                        // that added the file, so it has to be recognised by snapshot id
+                        if (entry.fileSequenceNumber() == currentSnapshotId
+                                || entry.snapshotId() == currentSnapshotId
+                                || entry.status() == IcebergManifestEntry.Status.EXISTING) {
+                            entries.add(entry);
+                        } else {
+                            // rewrite status if this entry is from an older snapshot
+                            IcebergManifestEntry.Status newStatus;
+                            if (entry.status() == IcebergManifestEntry.Status.ADDED) {
+                                newStatus = IcebergManifestEntry.Status.EXISTING;
+                            } else if (entry.status() == IcebergManifestEntry.Status.DELETED) {
+                                continue;
+                            } else {
+                                throw new UnsupportedOperationException(
+                                        "Unknown IcebergManifestEntry.Status " + entry.status());
+                            }
+                            entries.add(
+                                    new IcebergManifestEntry(
+                                            newStatus,
+                                            entry.snapshotId(),
+                                            entry.sequenceNumber(),
+                                            entry.fileSequenceNumber(),
+                                            entry.file()));
+                        }
+                    }
+                    if (meta.sequenceNumber() == currentSnapshotId) {
+                        // this file is created for this snapshot, so it is not recorded in any
+                        // iceberg metas, we need to clean it
+                        table.fileIO().deleteQuietly(new Path(meta.manifestPath()));
+                    }
+                    return entries;
+                };
+        Iterable<IcebergManifestEntry> newEntries =
+                ManifestReadThreadPool.sequentialBatchedExecute(processor, candidates, null);
+        result.addAll(manifestFile.rollingWrite(newEntries.iterator(), currentSnapshotId));
+        return result;
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Expire
+    // -------------------------------------------------------------------------------------
+
+    private boolean shouldExpire(IcebergSnapshot snapshot, long currentSnapshotId) {
+        Options options = new Options(table.options());
+        if (snapshot.snapshotId()
+                > currentSnapshotId - options.get(CoreOptions.SNAPSHOT_NUM_RETAINED_MIN)) {
+            return false;
+        }
+        if (snapshot.snapshotId()
+                <= currentSnapshotId - options.get(CoreOptions.SNAPSHOT_NUM_RETAINED_MAX)) {
+            return true;
+        }
+        return snapshot.timestampMs()
+                < System.currentTimeMillis()
+                        - options.get(CoreOptions.SNAPSHOT_TIME_RETAINED).toMillis();
+    }
+
+    private void expireManifestList(String toExpire, String next) {
+        // compare by physical path: a carried-over manifest may be re-listed with different
+        // list-level fields (e.g. an assigned first_row_id) while sharing the same file
+        Set<String> pathsInUse = new HashSet<>();
+        for (IcebergManifestFileMeta meta : manifestList.read(next)) {
+            pathsInUse.add(meta.manifestPath());
+        }
+        for (IcebergManifestFileMeta meta : manifestList.read(toExpire)) {
+            if (pathsInUse.contains(meta.manifestPath())) {
+                continue;
+            }
+            table.fileIO().deleteQuietly(new Path(meta.manifestPath()));
+        }
+        table.fileIO().deleteQuietly(pathFactory.toManifestListPath(toExpire));
+    }
+
+    private void expireAllBefore(long snapshotId) throws IOException {
+        Set<String> expiredManifestLists = new HashSet<>();
+        Set<String> expiredManifestFileMetas = new HashSet<>();
+        Iterator<Path> it =
+                pathFactory.getAllMetadataPathBefore(table.fileIO(), snapshotId).iterator();
+
+        while (it.hasNext()) {
+            Path path = it.next();
+            IcebergMetadata metadata = IcebergMetadata.fromPath(table.fileIO(), path);
+
+            for (IcebergSnapshot snapshot : metadata.snapshots()) {
+                Path listPath = new Path(snapshot.manifestList());
+                String listName = listPath.getName();
+                if (expiredManifestLists.contains(listName)) {
+                    continue;
+                }
+                expiredManifestLists.add(listName);
+
+                // A retained metadata JSON can reference a list an earlier rebuild already
+                // deleted. Reading it must not fail: we only open it to delete what it
+                // points at, and that earlier pass already did so.
+                if (!table.fileIO().exists(listPath)) {
+                    continue;
+                }
+
+                for (IcebergManifestFileMeta meta : manifestList.read(listName)) {
+                    String metaName = new Path(meta.manifestPath()).getName();
+                    if (expiredManifestFileMetas.contains(metaName)) {
+                        continue;
+                    }
+                    expiredManifestFileMetas.add(metaName);
+                    table.fileIO().deleteQuietly(new Path(meta.manifestPath()));
+                }
+                table.fileIO().deleteQuietly(listPath);
+            }
+        }
+        deleteApplicableMetadataFiles(snapshotId);
+    }
+
+    private void deleteApplicableMetadataFiles(long snapshotId) throws IOException {
+        Options options = new Options(table.options());
+        if (options.get(IcebergOptions.METADATA_DELETE_AFTER_COMMIT)) {
+            long earliestMetadataId =
+                    snapshotId - options.get(IcebergOptions.METADATA_PREVIOUS_VERSIONS_MAX);
+            if (earliestMetadataId > 0) {
+                Iterator<Path> it =
+                        pathFactory
+                                .getAllMetadataPathBefore(table.fileIO(), earliestMetadataId)
+                                .iterator();
+                while (it.hasNext()) {
+                    Path path = it.next();
+                    table.fileIO().deleteQuietly(path);
+                }
+            }
+        }
+    }
+
+    @Override
+    public void notifyCreation(String tagName) {
+        // The base TagCallback API does not carry a snapshot id, but Iceberg refs
+        // require one. The tag is persisted by TagManager before this callback
+        // fires, so resolve the snapshot the tag points to and delegate to the
+        // snapshot aware overload.
+        Optional<Tag> tag = table.tagManager().get(tagName);
+        if (!tag.isPresent()) {
+            LOG.info(
+                    "Tag {} not found in Paimon TagManager when creating Iceberg ref. Unable to create tag.",
+                    tagName);
+            return;
+        }
+        notifyCreation(tagName, tag.get().id());
+    }
+
+    @Override
+    public void notifyCreation(String tagName, long snapshotId) {
+        try {
+            Snapshot latestSnapshot = table.snapshotManager().latestSnapshot();
+            if (latestSnapshot == null) {
+                LOG.info(
+                        "Latest Iceberg snapshot not found when creating tag {} for snapshot {}. Unable to create tag.",
+                        tagName,
+                        snapshotId);
+                return;
+            }
+
+            Path baseMetadataPath = pathFactory.toMetadataPath(latestSnapshot.id());
+            if (!table.fileIO().exists(baseMetadataPath)) {
+                LOG.info(
+                        "Iceberg metadata file {} not found when creating tag {} for snapshot {}. Unable to create tag.",
+                        baseMetadataPath,
+                        tagName,
+                        snapshotId);
+                return;
+            }
+
+            IcebergMetadata baseMetadata =
+                    IcebergMetadata.fromPath(table.fileIO(), baseMetadataPath);
+
+            // Tags can only be included in Iceberg if they point to an Iceberg snapshot that
+            // exists. Otherwise an Iceberg client fails to parse the metadata and all reads fail.
+            boolean tagSnapshotInIceberg = false;
+            for (IcebergSnapshot snapshot : baseMetadata.snapshots()) {
+                if (snapshot.snapshotId() == snapshotId) {
+                    tagSnapshotInIceberg = true;
+                    break;
+                }
+            }
+
+            if (!tagSnapshotInIceberg) {
+                LOG.warn(
+                        "Snapshot {} does not exist in Iceberg metadata. Unable to create tag {}.",
+                        snapshotId,
+                        tagName);
+                return;
+            }
+
+            baseMetadata.refs().put(tagName, new IcebergRef(snapshotId));
+
+            IcebergMetadata metadata =
+                    new IcebergMetadata(
+                            baseMetadata.formatVersion(),
+                            baseMetadata.tableUuid(),
+                            baseMetadata.location(),
+                            baseMetadata.currentSnapshotId(),
+                            baseMetadata.lastColumnId(),
+                            baseMetadata.schemas(),
+                            baseMetadata.currentSchemaId(),
+                            baseMetadata.partitionSpecs(),
+                            baseMetadata.lastPartitionId(),
+                            baseMetadata.snapshots(),
+                            baseMetadata.currentSnapshotId(),
+                            baseMetadata.nextRowId(),
+                            baseMetadata.refs());
+
+            /*
+            Overwrite the latest metadata file
+            Currently the Paimon table snapshot id value is the same as the Iceberg metadata
+            version number. Tag creation overwrites the latest metadata file to maintain this.
+            There is no need to update the catalog after overwrite.
+             */
+            table.fileIO().overwriteFileUtf8(baseMetadataPath, metadata.toJson());
+            LOG.info(
+                    "Iceberg metadata file {} overwritten to add tag {} for snapshot {}.",
+                    baseMetadataPath,
+                    tagName,
+                    snapshotId);
+
+        } catch (IOException e) {
+            throw new UncheckedIOException(
+                    "Failed to create tag " + tagName + " for table " + table.name(), e);
+        }
+    }
+
+    @Override
+    public void notifyDeletion(String tagName) {
+        try {
+            Snapshot latestSnapshot = table.snapshotManager().latestSnapshot();
+            if (latestSnapshot == null) {
+                LOG.info(
+                        "Latest Iceberg snapshot not found when deleting tag {}. Unable to delete tag.",
+                        tagName);
+                return;
+            }
+
+            Path baseMetadataPath = pathFactory.toMetadataPath(latestSnapshot.id());
+            if (!table.fileIO().exists(baseMetadataPath)) {
+                LOG.info(
+                        "Iceberg metadata file {} not found when deleting tag {}. Unable to delete tag.",
+                        baseMetadataPath,
+                        tagName);
+                return;
+            }
+
+            IcebergMetadata baseMetadata =
+                    IcebergMetadata.fromPath(table.fileIO(), baseMetadataPath);
+
+            baseMetadata.refs().remove(tagName);
+
+            IcebergMetadata metadata =
+                    new IcebergMetadata(
+                            baseMetadata.formatVersion(),
+                            baseMetadata.tableUuid(),
+                            baseMetadata.location(),
+                            baseMetadata.currentSnapshotId(),
+                            baseMetadata.lastColumnId(),
+                            baseMetadata.schemas(),
+                            baseMetadata.currentSchemaId(),
+                            baseMetadata.partitionSpecs(),
+                            baseMetadata.lastPartitionId(),
+                            baseMetadata.snapshots(),
+                            baseMetadata.currentSnapshotId(),
+                            baseMetadata.nextRowId(),
+                            baseMetadata.refs());
+
+            /*
+            Overwrite the latest metadata file
+            Currently the Paimon table snapshot id value is the same as the Iceberg metadata
+            version number. Tag creation overwrites the latest metadata file to maintain this.
+            There is no need to update the catalog after overwrite.
+             */
+            table.fileIO().overwriteFileUtf8(baseMetadataPath, metadata.toJson());
+            LOG.info(
+                    "Iceberg metadata file {} overwritten to delete tag {}.",
+                    baseMetadataPath,
+                    tagName);
+
+        } catch (IOException e) {
+            throw new UncheckedIOException(
+                    "Failed to create tag " + tagName + " for table " + table.name(), e);
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Deletion vectors
+    // -------------------------------------------------------------------------------------
+
+    private boolean needAddDvToIceberg() {
+        CoreOptions options = table.coreOptions();
+        // there may be dv indexes using bitmap32 in index files even if 'deletion-vectors.bitmap64'
+        // is true, but analyzing all deletion vectors is very costly, so we do not check exactly
+        // currently.
+        return options.deletionVectorsEnabled()
+                && options.deletionVectorBitmap64()
+                && formatVersion == IcebergMetadata.FORMAT_VERSION_V3;
+    }
+
+    private List<IcebergManifestFileMeta> createDvManifestFileMetas(Snapshot snapshot) {
+        List<IcebergManifestEntry> icebergDvEntries = new ArrayList<>();
+
+        long snapshotId = snapshot.id();
+        List<IndexManifestEntry> newIndexes =
+                indexFileHandler.scan(snapshot, DELETION_VECTORS_INDEX);
+        if (newIndexes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        for (IndexManifestEntry entry : newIndexes) {
+            LinkedHashMap<String, DeletionVectorMeta> dvMetas = entry.indexFile().dvRanges();
+            Path bucketPath = fileStorePathFactory.bucketPath(entry.partition(), entry.bucket());
+            if (dvMetas != null) {
+                for (DeletionVectorMeta dvMeta : dvMetas.values()) {
+
+                    // Iceberg will check the cardinality between deserialized dv and iceberg
+                    // deletion file, so if deletionFile.cardinality() is null, we should stop
+                    // synchronizing all dvs.
+                    Preconditions.checkState(
+                            dvMeta.cardinality() != null,
+                            "cardinality in DeletionVector is null, stop generate dv for iceberg. "
+                                    + "dataFile path is {}, indexFile path is {}",
+                            new Path(bucketPath, dvMeta.dataFileName()),
+                            indexFileHandler.filePath(entry).toString());
+
+                    IcebergDataFileMeta deleteFileMeta =
+                            IcebergDataFileMeta.createForDeleteFile(
+                                    IcebergDataFileMeta.Content.POSITION_DELETES,
+                                    indexFileHandler.filePath(entry).toString(),
+                                    PUFFIN_FORMAT,
+                                    entry.partition(),
+                                    dvMeta.cardinality(),
+                                    entry.indexFile().fileSize(),
+                                    new Path(bucketPath, dvMeta.dataFileName()).toString(),
+                                    (long) dvMeta.offset(),
+                                    (long) dvMeta.length());
+
+                    icebergDvEntries.add(
+                            new IcebergManifestEntry(
+                                    IcebergManifestEntry.Status.ADDED,
+                                    snapshotId,
+                                    snapshotId,
+                                    snapshotId,
+                                    deleteFileMeta));
+                }
+            }
+        }
+
+        if (icebergDvEntries.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        return manifestFile.rollingWrite(
+                icebergDvEntries.iterator(), snapshotId, IcebergManifestFileMeta.Content.DELETES);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Snapshot Summary Computation
+    // -------------------------------------------------------------------------------------
+
+    private static class SummaryMetrics {
+        long addedDataFiles;
+        long addedRecords;
+        long addedFilesSize;
+        long deletedDataFiles;
+        long deletedRecords;
+        long deletedFilesSize;
+        long changedPartitionCount;
+        long totalDataFiles;
+        long totalRecords;
+        long totalFilesSize;
+        long totalDeleteFiles;
+        long totalPositionDeletes;
+        long totalEqualityDeletes;
+    }
+
+    /**
+     * Summary entry identifying the Paimon snapshot this metadata was built from; it tells live
+     * metadata from metadata a rollback abandoned.
+     */
+    static final String SNAPSHOT_SUMMARY_PAIMON_COMMIT_IDENTITY = "paimon-commit-identity";
+
+    private static String commitIdentity(Snapshot snapshot) {
+        // snapshot uuid when present; legacy snapshots fall back to user/identifier/time
+        if (snapshot.uuid() != null) {
+            return snapshot.uuid();
+        }
+        return snapshot.commitUser()
+                + ":"
+                + snapshot.commitIdentifier()
+                + ":"
+                + snapshot.timeMillis();
+    }
+
+    private IcebergSnapshotSummary computeSnapshotSummary(
+            String operation, Snapshot snapshot, SummaryMetrics metrics) {
+
+        IcebergSnapshotSummary summary = new IcebergSnapshotSummary(operation);
+
+        long addedDataFiles = Math.max(0, metrics.addedDataFiles);
+        long addedRecords = Math.max(0, metrics.addedRecords);
+        long addedFilesSize = Math.max(0, metrics.addedFilesSize);
+        long deletedDataFiles = Math.max(0, metrics.deletedDataFiles);
+        long deletedRecords = Math.max(0, metrics.deletedRecords);
+        long deletedFilesSize = Math.max(0, metrics.deletedFilesSize);
+        long changedPartitionCount = Math.max(0, metrics.changedPartitionCount);
+        long totalRecords = Math.max(0, metrics.totalRecords);
+        long totalDataFiles = Math.max(0, metrics.totalDataFiles);
+        long totalFilesSize = Math.max(0, metrics.totalFilesSize);
+        long totalDeleteFiles = Math.max(0, metrics.totalDeleteFiles);
+        long totalPositionDeletes = Math.max(0, metrics.totalPositionDeletes);
+        long totalEqualityDeletes = Math.max(0, metrics.totalEqualityDeletes);
+
+        summary.put(SNAPSHOT_SUMMARY_ADDED_DATA_FILES, Long.toString(addedDataFiles));
+        summary.put(SNAPSHOT_SUMMARY_ADDED_RECORDS, Long.toString(addedRecords));
+        summary.put(SNAPSHOT_SUMMARY_ADDED_FILES_SIZE, Long.toString(addedFilesSize));
+        summary.put(SNAPSHOT_SUMMARY_DELETED_DATA_FILES, Long.toString(deletedDataFiles));
+        summary.put(SNAPSHOT_SUMMARY_DELETED_RECORDS, Long.toString(deletedRecords));
+        summary.put(SNAPSHOT_SUMMARY_REMOVED_FILES_SIZE, Long.toString(deletedFilesSize));
+        summary.put(SNAPSHOT_SUMMARY_CHANGED_PARTITION_COUNT, Long.toString(changedPartitionCount));
+        summary.put(SNAPSHOT_SUMMARY_TOTAL_RECORDS, Long.toString(totalRecords));
+        summary.put(SNAPSHOT_SUMMARY_TOTAL_DATA_FILES, Long.toString(totalDataFiles));
+        summary.put(SNAPSHOT_SUMMARY_TOTAL_FILES_SIZE, Long.toString(totalFilesSize));
+        summary.put(SNAPSHOT_SUMMARY_TOTAL_DELETE_FILES, Long.toString(totalDeleteFiles));
+        summary.put(SNAPSHOT_SUMMARY_TOTAL_POSITION_DELETES, Long.toString(totalPositionDeletes));
+        summary.put(SNAPSHOT_SUMMARY_TOTAL_EQUALITY_DELETES, Long.toString(totalEqualityDeletes));
+
+        Map<String, String> properties = snapshot.properties();
+        if (properties != null) {
+            properties.forEach(
+                    (key, value) -> {
+                        if (value != null) {
+                            summary.put(key, value);
+                        }
+                    });
+        }
+        // after the user-property copy, so a same-key property cannot overwrite it
+        summary.put(SNAPSHOT_SUMMARY_PAIMON_COMMIT_IDENTITY, commitIdentity(snapshot));
+
+        return summary;
+    }
+
+    private long computeLiveFileCount(List<IcebergManifestFileMeta> manifestMetas) {
+        return manifestMetas.stream()
+                .mapToLong(
+                        meta ->
+                                meta.addedFilesCount()
+                                        + meta.existingFilesCount()
+                                        - meta.deletedFilesCount())
+                .sum();
+    }
+
+    private long computeLiveRowCount(List<IcebergManifestFileMeta> manifestMetas) {
+        return manifestMetas.stream()
+                .mapToLong(
+                        meta ->
+                                meta.addedRowsCount()
+                                        + meta.existingRowsCount()
+                                        - meta.deletedRowsCount())
+                .sum();
+    }
+
+    @Nullable
+    private Long getSummaryLong(@Nullable IcebergSnapshot snapshot, String key) {
+        if (snapshot == null) {
+            return null;
+        }
+        Map<String, String> summaryMap = snapshot.summary().getSummary();
+        String value = summaryMap.get(key);
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            LOG.warn(
+                    "Unable to parse snapshot summary field {}={} as long. The value will be recomputed.",
+                    key,
+                    value);
+            return null;
+        }
+    }
+
+    private long computeTotalFilesSizeFromManifests(List<IcebergManifestFileMeta> manifestMetas)
+            throws IOException {
+        long total = 0;
+        for (IcebergManifestFileMeta meta : manifestMetas) {
+            for (IcebergManifestEntry entry :
+                    manifestFile.read(new Path(meta.manifestPath()).getName())) {
+                if (entry.isLive()) {
+                    total += entry.file().fileSizeInBytes();
+                }
+            }
+        }
+        return total;
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Utils
+    // -------------------------------------------------------------------------------------
+
+    private boolean isSameFormatVersion(int baseFormatVersion) {
+        if (baseFormatVersion != formatVersion) {
+            Preconditions.checkArgument(
+                    formatVersion > baseFormatVersion,
+                    "format version in base metadata is {}, and it's bigger than the current format version {}, "
+                            + "this is not allowed!");
+
+            LOG.info(
+                    "format version in base metadata is {}, and it's different from the current format version {}. "
+                            + "New metadata will be recreated using format version {}.",
+                    baseFormatVersion,
+                    formatVersion,
+                    formatVersion);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Row-lineage bookkeeping for a new snapshot, mandatory in Iceberg format version 3: the
+     * snapshot's first-row-id starts at the base metadata's next-row-id watermark. The snapshot's
+     * added-rows and the table's next-row-id are NOT derived here: they depend on how many rows
+     * {@link #assignManifestFirstRowIds} actually assigns (which can exceed this commit's added
+     * records when a carried-over manifest is assigned for the first time, e.g. a Layer-1-written
+     * manifest being upgraded), so callers must recompute them from the assignment's result. For
+     * format version 2 the field stays null so nothing is written.
+     */
+    @Nullable
+    private Long computeSnapshotFirstRowId(long baseNextRowId) {
+        return formatVersion >= IcebergMetadata.FORMAT_VERSION_V3 ? baseNextRowId : null;
+    }
+
+    /**
+     * Result of {@link #assignManifestFirstRowIds}: the manifests with first_row_id assigned, and
+     * the total number of rows actually consumed from the row-id space by that assignment (which
+     * may be larger than this commit's added-records count; see the class-level note there).
+     */
+    private static class ManifestRowIdAssignment {
+        private final List<IcebergManifestFileMeta> manifests;
+        private final long assignedRows;
+
+        private ManifestRowIdAssignment(
+                List<IcebergManifestFileMeta> manifests, long assignedRows) {
+            this.manifests = manifests;
+            this.assignedRows = assignedRows;
+        }
+    }
+
+    /**
+     * Iceberg v3: assign first_row_id (field 520) to data manifests that do not have one yet.
+     * Manifests carried over from base metadata that are already assigned keep their value; delete
+     * manifests stay null. The watermark starts at the snapshot's first-row-id and advances by each
+     * newly-assigned manifest's TRUE inheriting-rows count (see {@link #trueInheritingRowsCount}),
+     * returned as {@link ManifestRowIdAssignment#assignedRows}.
+     *
+     * <p>A manifest written entirely under manifest-level assignment satisfies "inheriting rows ==
+     * ADDED rows", so the bound is exact for it. A manifest carried over from before assignment
+     * existed may hold EXISTING entries whose field 142 is also still null; the bound covers them
+     * without reading the manifest, at the cost of spec-legal id gaps when some of those entries
+     * were already materialized. DELETED entries never inherit ids and are excluded. Callers MUST
+     * use {@code assignedRows} (not this commit's added-records count) to advance the snapshot's
+     * added-rows / table next-row-id, precisely because of that mismatch.
+     */
+    private ManifestRowIdAssignment assignManifestFirstRowIds(
+            List<IcebergManifestFileMeta> manifests, @Nullable Long snapshotFirstRowId) {
+        if (snapshotFirstRowId == null) {
+            return new ManifestRowIdAssignment(manifests, 0L);
+        }
+        List<IcebergManifestFileMeta> result = new ArrayList<>();
+        long watermark = snapshotFirstRowId;
+        for (IcebergManifestFileMeta meta : manifests) {
+            if (meta.content() == IcebergManifestFileMeta.Content.DATA
+                    && meta.firstRowId() == null) {
+                result.add(meta.withFirstRowId(watermark));
+                // spec-sanctioned upper bound: only ADDED and EXISTING rows can inherit
+                // ids from this manifest (readers never assign ids to DELETED entries).
+                // Rows whose field 142 is already materialized merely widen the reserved
+                // range, leaving legal id gaps - in exchange the commit path never has to
+                // read manifest contents.
+                watermark += meta.addedRowsCount() + meta.existingRowsCount();
+            } else {
+                result.add(meta);
+            }
+        }
+        return new ManifestRowIdAssignment(result, watermark - snapshotFirstRowId);
+    }
+
+    /**
+     * Iceberg v3 requires the inherited first_row_id to be written into file metadata when entries
+     * are copied into a rewritten manifest. Computes each entry's effective id in base manifest
+     * order (explicit field 142, or inherited from the manifest's first_row_id, skipping DELETED
+     * entries exactly like GA readers do) and returns entries with the id materialized. No-op for
+     * delete manifests and for base manifests without an assigned first_row_id (v2 metadata, or v3
+     * metadata written before manifest-level assignment existed — those stay in the spec's
+     * upgraded-table state).
+     */
+    private static List<IcebergManifestEntry> materializeFirstRowIds(
+            IcebergManifestFileMeta baseMeta, List<IcebergManifestEntry> entries) {
+        if (baseMeta.content() != IcebergManifestFileMeta.Content.DATA
+                || baseMeta.firstRowId() == null) {
+            return entries;
+        }
+        List<IcebergManifestEntry> result = new ArrayList<>();
+        long watermark = baseMeta.firstRowId();
+        for (IcebergManifestEntry entry : entries) {
+            if (entry.status() != IcebergManifestEntry.Status.DELETED
+                    && entry.file().firstRowId() == null) {
+                result.add(entry.withFile(entry.file().withFirstRowId(watermark)));
+                watermark += entry.file().recordCount();
+            } else {
+                // DELETED entries never inherit an id (GA readers skip them when
+                // assigning), so their field 142 stays null and the walk does not advance
+                result.add(entry);
+            }
+        }
+        return result;
+    }
+
+    private class SchemaCache {
+
+        SchemaManager schemaManager = table.schemaManager();
+        Map<Long, IcebergSchema> schemas = new HashMap<>();
+
+        private IcebergSchema get(long schemaId) {
+            return schemas.computeIfAbsent(
+                    schemaId,
+                    id -> {
+                        TableSchema schema = schemaManager.schema(id);
+                        if (formatVersion < IcebergMetadata.FORMAT_VERSION_V3) {
+                            // VARIANT is an Iceberg format-version-3 type; v2 metadata cannot
+                            // represent it
+                            checkVariantNotPublishable(schema.logicalRowType());
+                        }
+                        SchemaValidation.validateIcebergGeospatialTypes(
+                                schema.logicalRowType(), table.coreOptions());
+                        SchemaValidation.validateIcebergTimestampPrecisions(
+                                schema.logicalRowType(), table.coreOptions());
+                        return IcebergSchema.create(schema);
+                    });
+        }
+
+        private long getLatestSchemaId() {
+            return schemaManager.latest().get().id();
+        }
+    }
+}

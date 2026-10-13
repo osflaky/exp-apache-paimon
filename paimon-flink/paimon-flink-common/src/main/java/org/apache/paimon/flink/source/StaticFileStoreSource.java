@@ -1,0 +1,215 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.source;
+
+import org.apache.paimon.flink.NestedProjectedRowData;
+import org.apache.paimon.flink.metrics.FlinkMetricRegistry;
+import org.apache.paimon.flink.source.assigners.FIFOSplitAssigner;
+import org.apache.paimon.flink.source.assigners.PreAssignSplitAssigner;
+import org.apache.paimon.flink.source.assigners.SplitAssigner;
+import org.apache.paimon.table.ChainGroupReadTable;
+import org.apache.paimon.table.source.InnerTableScan;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.table.source.TableScan;
+import org.apache.paimon.utils.SerializableFunction;
+
+import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.api.connector.source.SplitEnumerator;
+import org.apache.flink.api.connector.source.SplitEnumeratorContext;
+
+import javax.annotation.Nullable;
+
+import java.util.Collection;
+import java.util.List;
+
+import static org.apache.paimon.flink.FlinkConnectorOptions.SplitAssignMode;
+
+/** Bounded {@link FlinkSource} for reading records. It does not monitor new snapshots. */
+public class StaticFileStoreSource extends FlinkSource {
+
+    private static final long serialVersionUID = 3L;
+
+    private final int splitBatchSize;
+
+    private final SplitAssignMode splitAssignMode;
+
+    @Nullable private final DynamicPartitionFilteringInfo dynamicPartitionFilteringInfo;
+
+    @Nullable private final SerializableFunction<FileStoreSourceSplit, Long> splitWeightFunc;
+
+    @Nullable private final SerializableFunction<FileStoreSourceSplit, ?> splitGroupFunc;
+
+    private final boolean skipPreloadTargetSnapshot;
+
+    public StaticFileStoreSource(
+            ReadBuilder readBuilder,
+            @Nullable Long limit,
+            int splitBatchSize,
+            SplitAssignMode splitAssignMode,
+            boolean blobAsDescriptor) {
+        this(
+                readBuilder,
+                limit,
+                splitBatchSize,
+                splitAssignMode,
+                null,
+                null,
+                null,
+                null,
+                blobAsDescriptor,
+                false);
+    }
+
+    public StaticFileStoreSource(
+            ReadBuilder readBuilder,
+            @Nullable Long limit,
+            int splitBatchSize,
+            SplitAssignMode splitAssignMode,
+            @Nullable DynamicPartitionFilteringInfo dynamicPartitionFilteringInfo,
+            @Nullable NestedProjectedRowData rowData,
+            boolean blobAsDescriptor,
+            boolean skipPreloadTargetSnapshot) {
+        this(
+                readBuilder,
+                limit,
+                splitBatchSize,
+                splitAssignMode,
+                dynamicPartitionFilteringInfo,
+                rowData,
+                null,
+                null,
+                blobAsDescriptor,
+                skipPreloadTargetSnapshot);
+    }
+
+    public StaticFileStoreSource(
+            ReadBuilder readBuilder,
+            @Nullable Long limit,
+            int splitBatchSize,
+            SplitAssignMode splitAssignMode,
+            @Nullable SerializableFunction<FileStoreSourceSplit, Long> splitWeightFunc,
+            @Nullable SerializableFunction<FileStoreSourceSplit, ?> splitGroupFunc,
+            boolean blobAsDescriptor) {
+        this(
+                readBuilder,
+                limit,
+                splitBatchSize,
+                splitAssignMode,
+                null,
+                null,
+                splitWeightFunc,
+                splitGroupFunc,
+                blobAsDescriptor,
+                false);
+    }
+
+    public StaticFileStoreSource(
+            ReadBuilder readBuilder,
+            @Nullable Long limit,
+            int splitBatchSize,
+            SplitAssignMode splitAssignMode,
+            @Nullable DynamicPartitionFilteringInfo dynamicPartitionFilteringInfo,
+            @Nullable NestedProjectedRowData rowData,
+            @Nullable SerializableFunction<FileStoreSourceSplit, Long> splitWeightFunc,
+            @Nullable SerializableFunction<FileStoreSourceSplit, ?> splitGroupFunc,
+            boolean blobAsDescriptor,
+            boolean skipPreloadTargetSnapshot) {
+        super(readBuilder, limit, rowData, blobAsDescriptor);
+        this.splitBatchSize = splitBatchSize;
+        this.splitAssignMode = splitAssignMode;
+        this.dynamicPartitionFilteringInfo = dynamicPartitionFilteringInfo;
+        this.splitWeightFunc = splitWeightFunc;
+        this.splitGroupFunc = splitGroupFunc;
+        this.skipPreloadTargetSnapshot = skipPreloadTargetSnapshot;
+    }
+
+    @Override
+    public Boundedness getBoundedness() {
+        return Boundedness.BOUNDED;
+    }
+
+    @Override
+    public SplitEnumerator<FileStoreSourceSplit, PendingSplitsCheckpoint> restoreEnumerator(
+            SplitEnumeratorContext<FileStoreSourceSplit> context,
+            PendingSplitsCheckpoint checkpoint) {
+        Collection<FileStoreSourceSplit> splits =
+                checkpoint == null ? getSplits(context) : checkpoint.splits();
+        SplitAssigner splitAssigner =
+                createSplitAssigner(
+                        context,
+                        splitBatchSize,
+                        splitAssignMode,
+                        splits,
+                        splitWeightFunc,
+                        splitGroupFunc);
+        return new StaticFileStoreSplitEnumerator(
+                context, null, splitAssigner, dynamicPartitionFilteringInfo);
+    }
+
+    private List<FileStoreSourceSplit> getSplits(SplitEnumeratorContext context) {
+        FileStoreSourceSplitGenerator splitGenerator = new FileStoreSourceSplitGenerator();
+        TableScan scan = readBuilder.newScan();
+        if (skipPreloadTargetSnapshot && scan instanceof ChainGroupReadTable.ChainTableBatchScan) {
+            ((ChainGroupReadTable.ChainTableBatchScan) scan).skipPreloadTargetSnapshot();
+        }
+        // register scan metrics
+        if (context.metricGroup() != null) {
+            ((InnerTableScan) scan)
+                    .withMetricRegistry(new FlinkMetricRegistry(context.metricGroup()));
+        }
+        return splitGenerator.createSplits(scan.plan());
+    }
+
+    public static SplitAssigner createSplitAssigner(
+            SplitEnumeratorContext<FileStoreSourceSplit> context,
+            int splitBatchSize,
+            SplitAssignMode splitAssignMode,
+            Collection<FileStoreSourceSplit> splits) {
+        return createSplitAssigner(context, splitBatchSize, splitAssignMode, splits, null, null);
+    }
+
+    public static SplitAssigner createSplitAssigner(
+            SplitEnumeratorContext<FileStoreSourceSplit> context,
+            int splitBatchSize,
+            SplitAssignMode splitAssignMode,
+            Collection<FileStoreSourceSplit> splits,
+            @Nullable SerializableFunction<FileStoreSourceSplit, Long> splitWeightFunc) {
+        return createSplitAssigner(
+                context, splitBatchSize, splitAssignMode, splits, splitWeightFunc, null);
+    }
+
+    public static SplitAssigner createSplitAssigner(
+            SplitEnumeratorContext<FileStoreSourceSplit> context,
+            int splitBatchSize,
+            SplitAssignMode splitAssignMode,
+            Collection<FileStoreSourceSplit> splits,
+            @Nullable SerializableFunction<FileStoreSourceSplit, Long> splitWeightFunc,
+            @Nullable SerializableFunction<FileStoreSourceSplit, ?> splitGroupFunc) {
+        switch (splitAssignMode) {
+            case FAIR:
+                return new PreAssignSplitAssigner(
+                        splitBatchSize, context, splits, splitWeightFunc, splitGroupFunc);
+            case PREEMPTIVE:
+                return new FIFOSplitAssigner(splits);
+            default:
+                throw new UnsupportedOperationException(
+                        "Unsupported assign mode " + splitAssignMode);
+        }
+    }
+}

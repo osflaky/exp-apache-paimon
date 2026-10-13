@@ -1,0 +1,559 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.format.orc;
+
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.columnar.ColumnVector;
+import org.apache.paimon.data.columnar.ColumnarRow;
+import org.apache.paimon.data.columnar.ColumnarRowIterator;
+import org.apache.paimon.data.columnar.VectorizedColumnBatch;
+import org.apache.paimon.data.columnar.VectorizedRowIterator;
+import org.apache.paimon.data.shredding.MapSharedShreddingReadPlanFactory;
+import org.apache.paimon.data.shredding.ShreddingReadPlan;
+import org.apache.paimon.format.FormatMetadataUtils;
+import org.apache.paimon.format.FormatReaderFactory;
+import org.apache.paimon.format.OrcFormatReaderContext;
+import org.apache.paimon.format.fs.HadoopReadOnlyFileSystem;
+import org.apache.paimon.format.orc.filter.OrcFilters;
+import org.apache.paimon.format.shredding.ShreddingFormatReader;
+import org.apache.paimon.format.shredding.ShreddingReadPlanFactories;
+import org.apache.paimon.format.shredding.ShreddingReadPlanFactory;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.reader.FileRecordReader;
+import org.apache.paimon.reader.ReadBatchSizer;
+import org.apache.paimon.reader.RecordReader.RecordIterator;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.IOUtils;
+import org.apache.paimon.utils.Pair;
+import org.apache.paimon.utils.Pool;
+import org.apache.paimon.utils.RoaringBitmap32;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hive.ql.exec.vector.VectorizedRowBatch;
+import org.apache.hadoop.hive.ql.io.sarg.SearchArgument;
+import org.apache.hadoop.hive.ql.io.sarg.SearchArgumentFactory;
+import org.apache.orc.OrcConf;
+import org.apache.orc.OrcFile;
+import org.apache.orc.RecordReader;
+import org.apache.orc.StripeInformation;
+import org.apache.orc.TypeDescription;
+import org.apache.orc.impl.ReaderImpl;
+import org.apache.orc.impl.RecordReaderImpl;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.function.IntFunction;
+
+import static org.apache.paimon.format.orc.OrcTypeUtil.convertToOrcSchema;
+import static org.apache.paimon.format.orc.reader.AbstractOrcColumnVector.createPaimonVector;
+import static org.apache.paimon.utils.Preconditions.checkNotNull;
+
+/** An ORC reader that produces a stream of {@link ColumnarRow} records. */
+public class OrcReaderFactory implements FormatReaderFactory {
+
+    protected final Configuration hadoopConfig;
+    protected final TypeDescription schema;
+    protected final RowType tableType;
+    protected final List<OrcFilters.Predicate> conjunctPredicates;
+    protected final int batchSize;
+    protected final boolean deletionVectorsEnabled;
+    protected final boolean legacyTimestampLtzType;
+
+    /**
+     * @param hadoopConfig the hadoop config for orc reader.
+     * @param conjunctPredicates the filter predicates that can be evaluated.
+     * @param batchSize the batch size of orc reader.
+     */
+    public OrcReaderFactory(
+            final org.apache.hadoop.conf.Configuration hadoopConfig,
+            final RowType readType,
+            final List<OrcFilters.Predicate> conjunctPredicates,
+            final int batchSize,
+            final boolean deletionVectorsEnabled,
+            final boolean legacyTimestampLtzType) {
+        this.hadoopConfig = checkNotNull(hadoopConfig);
+        this.schema = convertToOrcSchema(readType);
+        this.tableType = readType;
+        this.conjunctPredicates = checkNotNull(conjunctPredicates);
+        this.batchSize = batchSize;
+        this.deletionVectorsEnabled = deletionVectorsEnabled;
+        this.legacyTimestampLtzType = legacyTimestampLtzType;
+    }
+
+    // ------------------------------------------------------------------------
+
+    @Override
+    public FileRecordReader<InternalRow> createReader(FormatReaderFactory.Context context)
+            throws IOException {
+        int poolSize =
+                context instanceof OrcFormatReaderContext
+                        ? ((OrcFormatReaderContext) context).poolSize()
+                        : 1;
+        org.apache.orc.Reader fileReader =
+                createReader(
+                        hadoopConfig, context.fileIO(), context.filePath(), context.selection());
+        try {
+            ShreddingReadPlan readPlan =
+                    ShreddingReadPlanFactories.createReadPlan(
+                            tableType,
+                            readFieldMetadata(fileReader),
+                            null,
+                            shreddingReadPlanFactories(tableType));
+            RowType physicalReadType = readPlan.physicalRowType();
+            TypeDescription physicalReadSchema =
+                    readPlan.isIdentity() ? schema : convertToOrcSchema(physicalReadType);
+            ReadBatchSizer readBatchSizer = context.readBatchSizer();
+            int defaultBatchSize = Math.max(1, batchSize / poolSize);
+            Pool<OrcReaderBatch> poolOfBatches =
+                    createPoolOfBatches(
+                            context.filePath(),
+                            poolSize,
+                            context.fileIO(),
+                            physicalReadSchema,
+                            physicalReadType,
+                            readBatchSizer);
+            IntFunction<OrcReaderBatch> batchFactory =
+                    size ->
+                            createReaderBatch(
+                                    context.filePath(),
+                                    createBatchWrapper(physicalReadSchema, size),
+                                    poolOfBatches.recycler(),
+                                    context.fileIO(),
+                                    physicalReadType);
+
+            OrcRecordReader orcReader =
+                    createRecordReader(
+                            hadoopConfig,
+                            fileReader,
+                            physicalReadSchema,
+                            conjunctPredicates,
+                            0,
+                            context.fileSize(),
+                            context.selection(),
+                            deletionVectorsEnabled);
+            OrcVectorizedReader orcVectorizedReader =
+                    new OrcVectorizedReader(
+                            orcReader,
+                            poolOfBatches,
+                            defaultBatchSize,
+                            readBatchSizer,
+                            batchFactory);
+            return readPlan.isIdentity()
+                    ? orcVectorizedReader
+                    : new ShreddingFormatReader(orcVectorizedReader, readPlan);
+        } catch (IOException | RuntimeException e) {
+            IOUtils.closeQuietly(fileReader);
+            throw e;
+        }
+    }
+
+    /**
+     * Creates the {@link OrcReaderBatch} structure, which is responsible for holding the data
+     * structures that hold the batch data (column vectors, row arrays, ...) and the batch
+     * conversion from the ORC representation to the result format.
+     */
+    public OrcReaderBatch createReaderBatch(
+            Path filePath,
+            VectorizedRowBatch orcBatch,
+            Pool.Recycler<OrcReaderBatch> recycler,
+            FileIO fileIO) {
+        return createReaderBatch(filePath, orcBatch, recycler, fileIO, tableType);
+    }
+
+    private OrcReaderBatch createReaderBatch(
+            Path filePath,
+            VectorizedRowBatch orcBatch,
+            Pool.Recycler<OrcReaderBatch> recycler,
+            FileIO fileIO,
+            RowType readType) {
+        List<String> tableFieldNames = readType.getFieldNames();
+        List<DataType> tableFieldTypes = readType.getFieldTypes();
+
+        // create and initialize the row batch
+        ColumnVector[] vectors = new ColumnVector[readType.getFieldCount()];
+        for (int i = 0; i < vectors.length; i++) {
+            String name = tableFieldNames.get(i);
+            DataType type = tableFieldTypes.get(i);
+            vectors[i] =
+                    createPaimonVector(
+                            orcBatch.cols[tableFieldNames.indexOf(name)],
+                            orcBatch,
+                            type,
+                            legacyTimestampLtzType);
+        }
+        return new OrcReaderBatch(
+                filePath, orcBatch, new VectorizedColumnBatch(vectors), recycler, fileIO);
+    }
+
+    // ------------------------------------------------------------------------
+
+    private static List<ShreddingReadPlanFactory> shreddingReadPlanFactories(RowType readType) {
+        return Collections.<ShreddingReadPlanFactory>singletonList(
+                new MapSharedShreddingReadPlanFactory(readType));
+    }
+
+    // ------------------------------------------------------------------------
+
+    private Pool<OrcReaderBatch> createPoolOfBatches(Path filePath, int numBatches, FileIO fileIO) {
+        return createPoolOfBatches(filePath, numBatches, fileIO, schema, tableType, null);
+    }
+
+    private Pool<OrcReaderBatch> createPoolOfBatches(
+            Path filePath,
+            int numBatches,
+            FileIO fileIO,
+            TypeDescription readSchema,
+            RowType readType,
+            @Nullable ReadBatchSizer readBatchSizer) {
+        final Pool<OrcReaderBatch> pool = new Pool<>(numBatches);
+        int defaultBatchSize = Math.max(1, batchSize / numBatches);
+        int allocatedBatchSize =
+                readBatchSizer == null
+                        ? defaultBatchSize
+                        : readBatchSizer.batchSize().orElse(defaultBatchSize);
+
+        for (int i = 0; i < numBatches; i++) {
+            final VectorizedRowBatch orcBatch = createBatchWrapper(readSchema, allocatedBatchSize);
+            final OrcReaderBatch batch =
+                    createReaderBatch(filePath, orcBatch, pool.recycler(), fileIO, readType);
+            pool.add(batch);
+        }
+
+        return pool;
+    }
+
+    // ------------------------------------------------------------------------
+
+    private static class OrcReaderBatch {
+
+        private final VectorizedRowBatch orcVectorizedRowBatch;
+        private final Pool.Recycler<OrcReaderBatch> recycler;
+
+        private final VectorizedColumnBatch paimonColumnBatch;
+        private final VectorizedRowIterator result;
+
+        protected OrcReaderBatch(
+                final Path filePath,
+                final VectorizedRowBatch orcVectorizedRowBatch,
+                final VectorizedColumnBatch paimonColumnBatch,
+                final Pool.Recycler<OrcReaderBatch> recycler,
+                final FileIO fileIO) {
+            this.orcVectorizedRowBatch = checkNotNull(orcVectorizedRowBatch);
+            this.recycler = checkNotNull(recycler);
+            this.paimonColumnBatch = paimonColumnBatch;
+            ColumnarRow row = new ColumnarRow(paimonColumnBatch);
+            row.setFileIO(fileIO);
+            this.result = new VectorizedRowIterator(filePath, row, this::recycle);
+        }
+
+        /**
+         * Puts this batch back into the pool. This should be called after all records from the
+         * batch have been returned, typically in the {@link RecordIterator#releaseBatch()} method.
+         */
+        public void recycle() {
+            recycler.recycle(this);
+        }
+
+        /** Gets the ORC VectorizedRowBatch structure from this batch. */
+        public VectorizedRowBatch orcVectorizedRowBatch() {
+            return orcVectorizedRowBatch;
+        }
+
+        public int batchSize() {
+            return orcVectorizedRowBatch.getMaxSize();
+        }
+
+        private ColumnarRowIterator convertAndGetIterator(
+                VectorizedRowBatch orcBatch, long rowNumber) {
+            // no copying from the ORC column vectors to the Paimon columns vectors necessary,
+            // because they point to the same data arrays internally design
+            paimonColumnBatch.setNumRows(orcBatch.size);
+            result.reset(rowNumber);
+            return result;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    /**
+     * A vectorized ORC reader. This reader reads an ORC Batch at a time and converts it to one or
+     * more records to be returned. An ORC Row-wise reader would convert the batch into a set of
+     * rows, while a reader for a vectorized query processor might return the whole batch as one
+     * record.
+     *
+     * <p>The conversion of the {@code VectorizedRowBatch} happens in the specific {@link
+     * OrcReaderBatch} implementation.
+     *
+     * <p>The reader tracks its current position using ORC's <i>row numbers</i>. Each record in a
+     * batch is addressed by the starting row number of the batch, plus the number of records to be
+     * skipped before.
+     */
+    private static final class OrcVectorizedReader implements FileRecordReader<InternalRow> {
+
+        private final OrcRecordReader orcReader;
+        private final Pool<OrcReaderBatch> pool;
+        private final int defaultBatchSize;
+        @Nullable private final ReadBatchSizer readBatchSizer;
+        private final IntFunction<OrcReaderBatch> batchFactory;
+
+        private OrcVectorizedReader(
+                final OrcRecordReader orcReader,
+                final Pool<OrcReaderBatch> pool,
+                final int defaultBatchSize,
+                @Nullable final ReadBatchSizer readBatchSizer,
+                final IntFunction<OrcReaderBatch> batchFactory) {
+            this.orcReader = checkNotNull(orcReader, "orcReader");
+            this.pool = checkNotNull(pool, "pool");
+            this.defaultBatchSize = defaultBatchSize;
+            this.readBatchSizer = readBatchSizer;
+            this.batchFactory = batchFactory;
+        }
+
+        @Nullable
+        @Override
+        public ColumnarRowIterator readBatch() throws IOException {
+            OrcReaderBatch batch = getCachedEntry();
+            // Snapshot after acquiring a reusable batch and before the physical read starts.
+            int nextBatchSize =
+                    readBatchSizer == null
+                            ? defaultBatchSize
+                            : readBatchSizer.batchSize().orElse(defaultBatchSize);
+            if (batch.batchSize() != nextBatchSize) {
+                // Only an acquired idle entry can be replaced. In-flight pooled batches retain
+                // their old vectors until consumers release them.
+                try {
+                    batch = batchFactory.apply(nextBatchSize);
+                } catch (RuntimeException | Error e) {
+                    // Preserve the pool size invariant if allocating the replacement fails.
+                    batch.recycle();
+                    throw e;
+                }
+            }
+            final VectorizedRowBatch orcVectorBatch = batch.orcVectorizedRowBatch();
+
+            long rowNumber = orcReader.recordReader.getRowNumber();
+            if (!nextBatch(orcReader.recordReader, orcVectorBatch)) {
+                batch.recycle();
+                return null;
+            }
+
+            return batch.convertAndGetIterator(orcVectorBatch, rowNumber);
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                orcReader.recordReader.close();
+            } finally {
+                orcReader.fileReader.close();
+            }
+        }
+
+        private OrcReaderBatch getCachedEntry() throws IOException {
+            try {
+                return pool.pollEntry();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted");
+            }
+        }
+    }
+
+    private static final class OrcRecordReader {
+
+        private final org.apache.orc.Reader fileReader;
+        private final RecordReader recordReader;
+
+        private OrcRecordReader(org.apache.orc.Reader fileReader, RecordReader recordReader) {
+            this.fileReader = fileReader;
+            this.recordReader = recordReader;
+        }
+    }
+
+    private static OrcRecordReader createRecordReader(
+            org.apache.hadoop.conf.Configuration conf,
+            TypeDescription schema,
+            List<OrcFilters.Predicate> conjunctPredicates,
+            FileIO fileIO,
+            org.apache.paimon.fs.Path path,
+            long splitStart,
+            long splitLength,
+            @Nullable RoaringBitmap32 selection,
+            boolean deletionVectorsEnabled)
+            throws IOException {
+        org.apache.orc.Reader orcReader = createReader(conf, fileIO, path, selection);
+        try {
+            return createRecordReader(
+                    conf,
+                    orcReader,
+                    schema,
+                    conjunctPredicates,
+                    splitStart,
+                    splitLength,
+                    selection,
+                    deletionVectorsEnabled);
+        } catch (IOException | RuntimeException e) {
+            IOUtils.closeQuietly(orcReader);
+            throw e;
+        }
+    }
+
+    private static OrcRecordReader createRecordReader(
+            org.apache.hadoop.conf.Configuration conf,
+            org.apache.orc.Reader orcReader,
+            TypeDescription schema,
+            List<OrcFilters.Predicate> conjunctPredicates,
+            long splitStart,
+            long splitLength,
+            @Nullable RoaringBitmap32 selection,
+            boolean deletionVectorsEnabled)
+            throws IOException {
+        try {
+            // get offset and length for the stripes that start in the split
+            Pair<Long, Long> offsetAndLength =
+                    getOffsetAndLengthForSplit(splitStart, splitLength, orcReader.getStripes());
+
+            // create ORC row reader configuration
+            boolean forcePositionalEvolution = OrcConf.FORCE_POSITIONAL_EVOLUTION.getBoolean(conf);
+            org.apache.orc.Reader.Options options =
+                    new org.apache.orc.Reader.Options()
+                            .schema(schema)
+                            .range(offsetAndLength.getLeft(), offsetAndLength.getRight())
+                            .useZeroCopy(OrcConf.USE_ZEROCOPY.getBoolean(conf))
+                            .skipCorruptRecords(OrcConf.SKIP_CORRUPT_DATA.getBoolean(conf))
+                            .tolerateMissingSchema(OrcConf.TOLERATE_MISSING_SCHEMA.getBoolean(conf))
+                            .forcePositionalEvolution(forcePositionalEvolution)
+                            .isSchemaEvolutionCaseAware(
+                                    OrcConf.IS_SCHEMA_EVOLUTION_CASE_SENSITIVE.getBoolean(conf));
+            if (forcePositionalEvolution) {
+                options.positionalEvolutionLevel(
+                        OrcConf.FORCE_POSITIONAL_EVOLUTION_LEVEL.getInt(conf));
+            }
+            if (!conjunctPredicates.isEmpty() && !deletionVectorsEnabled && selection == null) {
+                // row group filter push down will make row number change incorrect
+                // so deletion vectors mode and bitmap index cannot work with row group push down
+                options.useSelected(OrcConf.READER_USE_SELECTED.getBoolean(conf));
+                options.allowSARGToFilter(OrcConf.ALLOW_SARG_TO_FILTER.getBoolean(conf));
+            }
+            // configure filters
+            if (!conjunctPredicates.isEmpty()) {
+                SearchArgument.Builder b = SearchArgumentFactory.newBuilder();
+                b = b.startAnd();
+                for (OrcFilters.Predicate predicate : conjunctPredicates) {
+                    predicate.add(b);
+                }
+                b = b.end();
+                options.searchArgument(b.build(), new String[] {});
+            }
+
+            // create ORC row reader
+            RecordReader orcRowsReader = orcReader.rows(options);
+
+            // assign ids
+            schema.getId();
+
+            return new OrcRecordReader(orcReader, orcRowsReader);
+        } catch (IOException e) {
+            // exception happened, we need to close the reader
+            IOUtils.closeQuietly(orcReader);
+            throw e;
+        }
+    }
+
+    private static VectorizedRowBatch createBatchWrapper(TypeDescription schema, int batchSize) {
+        return schema.createRowBatch(batchSize);
+    }
+
+    private static boolean nextBatch(RecordReader reader, VectorizedRowBatch rowBatch)
+            throws IOException {
+        return reader.nextBatch(rowBatch);
+    }
+
+    private static Pair<Long, Long> getOffsetAndLengthForSplit(
+            long splitStart, long splitLength, List<StripeInformation> stripes) {
+        long splitEnd = splitStart + splitLength;
+        long readStart = Long.MAX_VALUE;
+        long readEnd = Long.MIN_VALUE;
+
+        for (StripeInformation s : stripes) {
+            if (splitStart <= s.getOffset() && s.getOffset() < splitEnd) {
+                // stripe starts in split, so it is included
+                readStart = Math.min(readStart, s.getOffset());
+                readEnd = Math.max(readEnd, s.getOffset() + s.getLength());
+            }
+        }
+
+        if (readStart < Long.MAX_VALUE) {
+            // at least one split is included
+            return Pair.of(readStart, readEnd - readStart);
+        } else {
+            return Pair.of(0L, 0L);
+        }
+    }
+
+    public static Map<String, Map<String, String>> readFieldMetadata(
+            org.apache.orc.Reader fileReader) {
+        if (!fileReader.getMetadataKeys().contains(FormatMetadataUtils.ARROW_SCHEMA_METADATA_KEY)) {
+            return Collections.emptyMap();
+        }
+        String encodedSchema =
+                StandardCharsets.UTF_8
+                        .decode(
+                                fileReader
+                                        .getMetadataValue(
+                                                FormatMetadataUtils.ARROW_SCHEMA_METADATA_KEY)
+                                        .duplicate())
+                        .toString();
+        return FormatMetadataUtils.readFieldMetadata(
+                FormatMetadataUtils.decodeMetadata(
+                                Collections.singletonMap(
+                                        FormatMetadataUtils.ARROW_SCHEMA_METADATA_KEY,
+                                        encodedSchema))
+                        .get(FormatMetadataUtils.ARROW_SCHEMA_METADATA_KEY));
+    }
+
+    public static org.apache.orc.Reader createReader(
+            org.apache.hadoop.conf.Configuration conf,
+            FileIO fileIO,
+            org.apache.paimon.fs.Path path,
+            @Nullable RoaringBitmap32 selection)
+            throws IOException {
+        // open ORC file and create reader
+        org.apache.hadoop.fs.Path hPath = new org.apache.hadoop.fs.Path(path.toUri());
+
+        OrcFile.ReaderOptions readerOptions = OrcFile.readerOptions(conf);
+
+        // configure filesystem from Paimon FileIO
+        readerOptions.filesystem(new HadoopReadOnlyFileSystem(fileIO));
+
+        return new ReaderImpl(hPath, readerOptions) {
+            @Override
+            public RecordReader rows(Options options) throws IOException {
+                return new RecordReaderImpl(this, options, selection);
+            }
+        };
+    }
+}

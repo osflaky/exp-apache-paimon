@@ -1,0 +1,476 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.utils;
+
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.shredding.MapSelectedKeysMetadataUtils;
+import org.apache.paimon.schema.IndexCastMapping;
+import org.apache.paimon.schema.SchemaEvolutionUtil;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.SpecialFields;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+
+import org.assertj.core.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/** Test for {@link FormatReaderMapping.Builder}. */
+public class FormatReaderMappingTest {
+
+    @Test
+    public void testTrimKeyFields() {
+        List<DataField> keyFields = new ArrayList<>();
+        List<DataField> allFields = new ArrayList<>();
+        List<DataField> testFields = new ArrayList<>();
+
+        for (int i = 0; i < 10; i++) {
+            keyFields.add(
+                    new DataField(
+                            SpecialFields.KEY_FIELD_ID_START + i,
+                            SpecialFields.KEY_FIELD_PREFIX + i,
+                            DataTypes.STRING()));
+        }
+
+        allFields.addAll(keyFields);
+        for (int i = 0; i < 20; i++) {
+            allFields.add(new DataField(i, String.valueOf(i), DataTypes.STRING()));
+        }
+
+        testFields.add(
+                new DataField(
+                        SpecialFields.KEY_FIELD_ID_START + 1,
+                        SpecialFields.KEY_FIELD_PREFIX + 1,
+                        DataTypes.STRING()));
+        testFields.add(
+                new DataField(
+                        SpecialFields.KEY_FIELD_ID_START + 3,
+                        SpecialFields.KEY_FIELD_PREFIX + 3,
+                        DataTypes.STRING()));
+        testFields.add(
+                new DataField(
+                        SpecialFields.KEY_FIELD_ID_START + 5,
+                        SpecialFields.KEY_FIELD_PREFIX + 5,
+                        DataTypes.STRING()));
+        testFields.add(
+                new DataField(
+                        SpecialFields.KEY_FIELD_ID_START + 7,
+                        SpecialFields.KEY_FIELD_PREFIX + 7,
+                        DataTypes.STRING()));
+        testFields.add(new DataField(3, String.valueOf(3), DataTypes.STRING()));
+        testFields.add(new DataField(4, String.valueOf(4), DataTypes.STRING()));
+        testFields.add(new DataField(5, String.valueOf(5), DataTypes.STRING()));
+        testFields.add(new DataField(1, String.valueOf(1), DataTypes.STRING()));
+        testFields.add(new DataField(6, String.valueOf(6), DataTypes.STRING()));
+
+        Pair<int[], RowType> res = FormatReaderMapping.Builder.trimKeyFields(testFields, allFields);
+
+        Assertions.assertThat(res.getKey()).containsExactly(0, 1, 2, 3, 1, 4, 2, 0, 5);
+
+        List<DataField> fields = res.getRight().getFields();
+        Assertions.assertThat(fields.size()).isEqualTo(6);
+        Assertions.assertThat(fields.get(0).id()).isEqualTo(1);
+        Assertions.assertThat(fields.get(1).id()).isEqualTo(3);
+        Assertions.assertThat(fields.get(2).id()).isEqualTo(5);
+        Assertions.assertThat(fields.get(3).id()).isEqualTo(7);
+        Assertions.assertThat(fields.get(4).id()).isEqualTo(4);
+        Assertions.assertThat(fields.get(5).id()).isEqualTo(6);
+    }
+
+    @Test
+    public void testTrimKeyWithIndexMapping() {
+        List<DataField> readTableFields = new ArrayList<>();
+        List<DataField> readDataFields = new ArrayList<>();
+
+        readTableFields.add(
+                new DataField(
+                        SpecialFields.KEY_FIELD_ID_START + 1,
+                        SpecialFields.KEY_FIELD_PREFIX + "a",
+                        DataTypes.STRING()));
+        readTableFields.add(new DataField(0, "0", DataTypes.STRING()));
+        readTableFields.add(new DataField(1, "a", DataTypes.STRING()));
+        readTableFields.add(new DataField(2, "2", DataTypes.STRING()));
+        readTableFields.add(new DataField(3, "3", DataTypes.STRING()));
+
+        readDataFields.add(
+                new DataField(
+                        SpecialFields.KEY_FIELD_ID_START + 1,
+                        SpecialFields.KEY_FIELD_PREFIX + "a",
+                        DataTypes.STRING()));
+        readDataFields.add(new DataField(0, "0", DataTypes.STRING()));
+        readDataFields.add(new DataField(1, "a", DataTypes.STRING()));
+        readDataFields.add(new DataField(3, "3", DataTypes.STRING()));
+
+        // build index cast mapping
+        IndexCastMapping indexCastMapping =
+                SchemaEvolutionUtil.createIndexCastMapping(readTableFields, readDataFields);
+
+        // map from key fields reading to value fields reading
+        Pair<int[], RowType> trimmedKeyPair =
+                FormatReaderMapping.Builder.trimKeyFields(readDataFields, readDataFields);
+
+        FormatReaderMapping formatReaderMapping =
+                new FormatReaderMapping(
+                        indexCastMapping.getIndexMapping(),
+                        indexCastMapping.getCastMapping(),
+                        trimmedKeyPair.getLeft(),
+                        null,
+                        null,
+                        null,
+                        null,
+                        Collections.emptyMap(),
+                        null,
+                        null);
+
+        Assertions.assertThat(formatReaderMapping.getIndexMapping())
+                .containsExactly(0, 1, 0, -1, 2);
+        List<DataField> trimmed = trimmedKeyPair.getRight().getFields();
+        Assertions.assertThat(trimmed.get(0).id()).isEqualTo(1);
+        Assertions.assertThat(trimmed.get(1).id()).isEqualTo(0);
+        Assertions.assertThat(trimmed.get(2).id()).isEqualTo(3);
+        Assertions.assertThat(trimmed.size()).isEqualTo(3);
+    }
+
+    @Test
+    public void testMapSelectedKeysKeepsSelectedRowTypeForFormatReader() throws Exception {
+        RowType dataValueType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(10, "a", DataTypes.INT()),
+                        DataTypes.FIELD(11, "b", DataTypes.INT()),
+                        DataTypes.FIELD(12, "c", DataTypes.INT()));
+        RowType selectedKeysType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(0, "0", dataValueType),
+                        DataTypes.FIELD(1, "1", dataValueType));
+
+        DataField dataField =
+                DataTypes.FIELD(2, "attrs", DataTypes.MAP(DataTypes.STRING(), dataValueType));
+        DataField expectedField =
+                MapSelectedKeysMetadataUtils.withSelectedKeys(
+                        DataTypes.FIELD(2, "attrs", selectedKeysType),
+                        selectedKeysType,
+                        Arrays.asList("key1", "key2"));
+
+        List<DataField> dataFields = Collections.singletonList(dataField);
+        List<DataField> expectedFields = Collections.singletonList(expectedField);
+
+        DataField readField = invokeDataFields(dataFields, expectedFields).get(0);
+
+        Assertions.assertThat(readField.type()).isEqualTo(selectedKeysType);
+        Assertions.assertThat(MapSelectedKeysMetadataUtils.isMapSelectedKeysField(readField))
+                .isTrue();
+    }
+
+    @Test
+    public void testMapSelectedKeysUsesDataValueTypeForSchemaEvolution() throws Exception {
+        DataField dataField =
+                DataTypes.FIELD(2, "attrs", DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()));
+        DataField expectedField = selectedKeysField(2, "attrs", DataTypes.BIGINT());
+
+        DataField readField =
+                invokeDataFields(
+                                Collections.singletonList(dataField),
+                                Collections.singletonList(expectedField))
+                        .get(0);
+        RowType readType = (RowType) readField.type();
+        Assertions.assertThat(readType.getTypeAt(0)).isEqualTo(DataTypes.INT());
+        Assertions.assertThat(MapSelectedKeysMetadataUtils.isMapSelectedKeysField(readField))
+                .isTrue();
+
+        IndexCastMapping mapping =
+                SchemaEvolutionUtil.createIndexCastMapping(
+                        Collections.singletonList(expectedField),
+                        Collections.singletonList(readField));
+        Assertions.assertThat(mapping.getCastMapping()).isNotNull();
+        InternalRow selectedKeys =
+                mapping.getCastMapping()[0].getFieldOrNull(GenericRow.of(GenericRow.of(10)));
+        Assertions.assertThat(selectedKeys.getLong(0)).isEqualTo(10L);
+    }
+
+    @Test
+    public void testMapSelectedKeysUsesDataFieldNameAfterRename() throws Exception {
+        DataField dataField =
+                DataTypes.FIELD(
+                        2, "old_attrs", DataTypes.MAP(DataTypes.STRING(), DataTypes.BIGINT()));
+        DataField expectedField = selectedKeysField(2, "new_attrs", DataTypes.BIGINT());
+
+        DataField readField =
+                invokeDataFields(
+                                Collections.singletonList(dataField),
+                                Collections.singletonList(expectedField))
+                        .get(0);
+
+        Assertions.assertThat(readField.name()).isEqualTo("old_attrs");
+        Assertions.assertThat(readField.description()).isEqualTo(expectedField.description());
+        Assertions.assertThat(MapSelectedKeysMetadataUtils.isMapSelectedKeysField(readField))
+                .isTrue();
+    }
+
+    @Test
+    public void testRejectMapSelectedKeysValuePartialProjection() {
+        RowType tableValueType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(10, "a", DataTypes.INT()),
+                        DataTypes.FIELD(11, "b", DataTypes.INT()));
+        RowType selectedValueType = DataTypes.ROW(DataTypes.FIELD(10, "a", DataTypes.INT()));
+        DataField tableField =
+                DataTypes.FIELD(2, "attrs", DataTypes.MAP(DataTypes.STRING(), tableValueType));
+        DataField expectedField = selectedKeysField(2, "attrs", selectedValueType);
+
+        Map<String, String> options = new HashMap<>();
+        options.put("fields.attrs.map.storage-layout", "shared-shredding");
+
+        Assertions.assertThatThrownBy(
+                        () ->
+                                invokeSelectedKeysFieldIds(
+                                        tableSchema(Collections.singletonList(tableField), options),
+                                        Collections.singletonList(expectedField)))
+                .hasRootCauseMessage(
+                        "Selected-key MAP pushdown does not support pruning MAP value fields: attrs.");
+    }
+
+    @Test
+    public void testMapSelectedKeysOnlySupportsTopLevelSharedShreddingMap() throws Exception {
+        DataField tableField =
+                DataTypes.FIELD(2, "attrs", DataTypes.MAP(DataTypes.STRING(), DataTypes.BIGINT()));
+        DataField expectedField = selectedKeysField(2, "attrs", DataTypes.BIGINT());
+
+        Map<String, String> options = new HashMap<>();
+        options.put("fields.attrs.map.storage-layout", "shared-shredding");
+        Assertions.assertThat(
+                        invokeSelectedKeysFieldIds(
+                                tableSchema(Collections.singletonList(tableField), options),
+                                Collections.singletonList(expectedField)))
+                .containsExactly(2);
+
+        Assertions.assertThatThrownBy(
+                        () ->
+                                invokeSelectedKeysFieldIds(
+                                        tableSchema(
+                                                Collections.singletonList(tableField),
+                                                Collections.emptyMap()),
+                                        Collections.singletonList(expectedField)))
+                .hasRootCauseMessage(
+                        "Selected-key MAP pushdown only supports top-level shared-shredding MAP field: attrs.");
+    }
+
+    @Test
+    public void testNormalRowWithSelectedKeysMetadataComment() throws Exception {
+        RowType rowType = DataTypes.ROW(DataTypes.FIELD(3, "value", DataTypes.BIGINT()));
+        DataField rowField =
+                DataTypes.FIELD(2, "payload", rowType)
+                        .newDescription(MapSelectedKeysMetadataUtils.METADATA_KEY + "key1");
+        TableSchema tableSchema =
+                tableSchema(Collections.singletonList(rowField), Collections.emptyMap());
+
+        Set<Integer> selectedKeysFieldIds =
+                invokeSelectedKeysFieldIds(tableSchema, Collections.singletonList(rowField));
+
+        Assertions.assertThat(selectedKeysFieldIds).isEmpty();
+        Assertions.assertThat(
+                        invokeDataFields(
+                                Collections.singletonList(rowField),
+                                Collections.singletonList(rowField),
+                                selectedKeysFieldIds))
+                .containsExactly(rowField);
+    }
+
+    @Test
+    public void testAddedNestedLeafReadsSiblingAsNullabilityAnchor() throws Exception {
+        DataField dataField =
+                DataTypes.FIELD(
+                        1, "payload", DataTypes.ROW(DataTypes.FIELD(2, "x", DataTypes.INT())));
+        DataField expectedField =
+                DataTypes.FIELD(
+                        1, "payload", DataTypes.ROW(DataTypes.FIELD(3, "y", DataTypes.INT())));
+
+        List<DataField> readFields =
+                invokeNestedDataFields(
+                        Collections.singletonList(dataField),
+                        Collections.singletonList(expectedField),
+                        Collections.emptySet());
+
+        Assertions.assertThat(readFields).containsExactly(dataField);
+        IndexCastMapping mapping =
+                SchemaEvolutionUtil.createIndexCastMapping(
+                        Collections.singletonList(expectedField), readFields);
+        InternalRow evolved =
+                mapping.getCastMapping()[0].getFieldOrNull(GenericRow.of(GenericRow.of(10)));
+        Assertions.assertThat(evolved).isNotNull();
+        Assertions.assertThat(evolved.isNullAt(0)).isTrue();
+        Object nullParent =
+                mapping.getCastMapping()[0].getFieldOrNull(GenericRow.of((Object) null));
+        Assertions.assertThat(nullParent).isNull();
+    }
+
+    @Test
+    public void testDeepAddedNestedLeafReadsSiblingAsNullabilityAnchor() throws Exception {
+        DataField dataField =
+                DataTypes.FIELD(
+                        1,
+                        "payload",
+                        DataTypes.ROW(
+                                DataTypes.FIELD(
+                                        2,
+                                        "sub",
+                                        DataTypes.ROW(
+                                                DataTypes.FIELD(3, "existing", DataTypes.INT())))));
+        DataField expectedField =
+                DataTypes.FIELD(
+                        1,
+                        "payload",
+                        DataTypes.ROW(
+                                DataTypes.FIELD(
+                                        2,
+                                        "sub",
+                                        DataTypes.ROW(
+                                                DataTypes.FIELD(4, "added", DataTypes.INT())))));
+
+        List<DataField> readFields =
+                invokeNestedDataFields(
+                        Collections.singletonList(dataField),
+                        Collections.singletonList(expectedField),
+                        Collections.emptySet());
+
+        Assertions.assertThat(readFields).containsExactly(dataField);
+        IndexCastMapping mapping =
+                SchemaEvolutionUtil.createIndexCastMapping(
+                        Collections.singletonList(expectedField), readFields);
+        InternalRow evolved =
+                mapping.getCastMapping()[0].getFieldOrNull(
+                        GenericRow.of(GenericRow.of(GenericRow.of(10))));
+        Assertions.assertThat(evolved).isNotNull();
+        InternalRow evolvedSub = evolved.getRow(0, 1);
+        Assertions.assertThat(evolvedSub).isNotNull();
+        Assertions.assertThat(evolvedSub.isNullAt(0)).isTrue();
+        InternalRow nullSub =
+                mapping.getCastMapping()[0].getFieldOrNull(
+                        GenericRow.of(GenericRow.of((Object) null)));
+        Assertions.assertThat(nullSub).isNotNull();
+        Assertions.assertThat(nullSub.isNullAt(0)).isTrue();
+    }
+
+    @Test
+    public void testAddedNestedLeafDoesNotReadSiblingWhenNestedFieldDisabled() throws Exception {
+        DataField dataField =
+                DataTypes.FIELD(
+                        1, "payload", DataTypes.ROW(DataTypes.FIELD(2, "x", DataTypes.INT())));
+        DataField expectedField =
+                DataTypes.FIELD(
+                        1, "payload", DataTypes.ROW(DataTypes.FIELD(3, "y", DataTypes.INT())));
+
+        Assertions.assertThat(
+                        invokeDataFields(
+                                Collections.singletonList(dataField),
+                                Collections.singletonList(expectedField),
+                                Collections.emptySet()))
+                .isEmpty();
+    }
+
+    @Test
+    public void testRejectSelectedKeysDataFieldWithNonMapType() {
+        DataField dataField = DataTypes.FIELD(2, "attrs", DataTypes.BIGINT());
+        DataField expectedField = selectedKeysField(2, "attrs", DataTypes.BIGINT());
+
+        Assertions.assertThatThrownBy(
+                        () ->
+                                invokeDataFields(
+                                        Collections.singletonList(dataField),
+                                        Collections.singletonList(expectedField)))
+                .hasRootCauseMessage(
+                        "Selected-key MAP field attrs should be MAP type in data schema.");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<DataField> invokeDataFields(
+            List<DataField> allDataFields, List<DataField> expectedFields) throws Exception {
+        return invokeDataFields(allDataFields, expectedFields, Collections.singleton(2));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<DataField> invokeDataFields(
+            List<DataField> allDataFields,
+            List<DataField> expectedFields,
+            Set<Integer> selectedKeysFieldIds)
+            throws Exception {
+        FormatReaderMapping.Builder builder =
+                new FormatReaderMapping.Builder(
+                        null, Collections.emptyList(), null, null, null, null);
+        Method method =
+                FormatReaderMapping.Builder.class.getDeclaredMethod(
+                        "readDataFields", List.class, List.class, Set.class);
+        method.setAccessible(true);
+        return (List<DataField>)
+                method.invoke(builder, allDataFields, expectedFields, selectedKeysFieldIds);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<DataField> invokeNestedDataFields(
+            List<DataField> allDataFields,
+            List<DataField> expectedFields,
+            Set<Integer> selectedKeysFieldIds)
+            throws Exception {
+        FormatReaderMapping.Builder builder =
+                new FormatReaderMapping.Builder(
+                        null, Collections.emptyList(), null, null, null, null);
+        Method method =
+                FormatReaderMapping.Builder.class.getDeclaredMethod(
+                        "readDataFields", List.class, List.class, Set.class, boolean.class);
+        method.setAccessible(true);
+        return (List<DataField>)
+                method.invoke(builder, allDataFields, expectedFields, selectedKeysFieldIds, true);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<Integer> invokeSelectedKeysFieldIds(
+            TableSchema tableSchema, List<DataField> expectedFields) throws Exception {
+        FormatReaderMapping.Builder builder =
+                new FormatReaderMapping.Builder(
+                        null, Collections.emptyList(), null, null, null, null);
+        Method method =
+                FormatReaderMapping.Builder.class.getDeclaredMethod(
+                        "selectedKeysFieldIds", TableSchema.class, List.class);
+        method.setAccessible(true);
+        return (Set<Integer>) method.invoke(builder, tableSchema, expectedFields);
+    }
+
+    private static DataField selectedKeysField(
+            int id, String name, org.apache.paimon.types.DataType valueType) {
+        RowType selectedKeysType = DataTypes.ROW(DataTypes.FIELD(0, "0", valueType));
+        return MapSelectedKeysMetadataUtils.withSelectedKeys(
+                DataTypes.FIELD(id, name, selectedKeysType),
+                selectedKeysType,
+                Collections.singletonList("key1"));
+    }
+
+    private static TableSchema tableSchema(List<DataField> fields, Map<String, String> options) {
+        return new TableSchema(
+                1, fields, 100, Collections.emptyList(), Collections.emptyList(), options, "");
+    }
+}

@@ -1,0 +1,436 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.sink;
+
+import org.apache.paimon.CoreOptions.TagCreationMode;
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.flink.compact.changelog.ChangelogCompactCoordinateOperator;
+import org.apache.paimon.flink.compact.changelog.ChangelogCompactSortOperator;
+import org.apache.paimon.flink.compact.changelog.ChangelogCompactWorkerOperator;
+import org.apache.paimon.flink.compact.changelog.ChangelogTaskTypeInfo;
+import org.apache.paimon.manifest.ManifestCommittable;
+import org.apache.paimon.options.MemorySize;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.utils.UriReaderFactory;
+
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.operators.SlotSharingGroup;
+import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.typeutils.EitherTypeInfo;
+import org.apache.flink.configuration.ExecutionOptions;
+import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSink;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.CheckpointConfig;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperatorFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.Serializable;
+import java.util.HashSet;
+import java.util.LinkedList;
+import java.util.Queue;
+import java.util.Set;
+
+import static org.apache.paimon.CoreOptions.WRITE_ONLY;
+import static org.apache.paimon.CoreOptions.createCommitUser;
+import static org.apache.paimon.flink.FlinkConnectorOptions.END_INPUT_WATERMARK;
+import static org.apache.paimon.flink.FlinkConnectorOptions.PRECOMMIT_COMPACT;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_AUTO_TAG_FOR_SAVEPOINT;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_CPU;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_MEMORY;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_COMMITTER_OPERATOR_CHAINING;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_MANAGED_WRITER_BUFFER_MEMORY;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_OPERATOR_UID_SUFFIX;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_USE_MANAGED_MEMORY;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_WRITER_CPU;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SINK_WRITER_MEMORY;
+import static org.apache.paimon.flink.FlinkConnectorOptions.generateCustomUid;
+import static org.apache.paimon.flink.utils.ManagedMemoryUtils.declareManagedMemory;
+import static org.apache.paimon.flink.utils.ParallelismUtils.forwardParallelism;
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+
+/** Abstract sink of paimon. */
+public abstract class FlinkSink<T> implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    private static final String WRITER_NAME = "Writer";
+    private static final String WRITER_WRITE_ONLY_NAME = "Writer(write-only)";
+    private static final String GLOBAL_COMMITTER_NAME = "Global Committer";
+
+    protected final FileStoreTable table;
+    private final boolean ignorePreviousFiles;
+
+    @Nullable private UriReaderFactory blobDescriptorReaderFactory;
+
+    public FlinkSink(FileStoreTable table, boolean ignorePreviousFiles) {
+        this.table = table;
+        this.ignorePreviousFiles = ignorePreviousFiles;
+    }
+
+    void setBlobDescriptorReaderFactory(UriReaderFactory uriReaderFactory) {
+        this.blobDescriptorReaderFactory = uriReaderFactory;
+    }
+
+    public DataStreamSink<?> sinkFrom(DataStream<T> input) {
+        // This commitUser is valid only for new jobs.
+        // After the job starts, this commitUser will be recorded into the states of write and
+        // commit operators.
+        // When the job restarts, commitUser will be recovered from states and this value is
+        // ignored.
+        return sinkFrom(input, createCommitUser(table.coreOptions().toConfiguration()));
+    }
+
+    public DataStreamSink<?> sinkFrom(DataStream<T> input, String initialCommitUser) {
+        // do the actually writing action, no snapshot generated in this stage
+        DataStream<Committable> written = doWrite(input, initialCommitUser, null);
+        // commit the committable to generate a new snapshot
+        return doCommit(written, initialCommitUser);
+    }
+
+    private boolean hasSinkMaterializer(DataStream<T> input) {
+        // traverse the transformation graph with breadth first search
+        Set<Integer> visited = new HashSet<>();
+        Queue<Transformation<?>> queue = new LinkedList<>();
+        queue.add(input.getTransformation());
+        visited.add(input.getTransformation().getId());
+        while (!queue.isEmpty()) {
+            Transformation<?> transformation = queue.poll();
+            if (transformation.getName().startsWith("SinkMaterializer")) {
+                return true;
+            }
+            for (Transformation<?> prev : transformation.getInputs()) {
+                if (!visited.contains(prev.getId())) {
+                    queue.add(prev);
+                    visited.add(prev.getId());
+                }
+            }
+        }
+        return false;
+    }
+
+    public DataStream<Committable> doWrite(
+            DataStream<T> input, String commitUser, @Nullable Integer parallelism) {
+        StreamExecutionEnvironment env = input.getExecutionEnvironment();
+        boolean isStreaming = isStreaming(input);
+
+        boolean writeOnly = writeOnly();
+        StoreSinkWrite.Provider writeProvider =
+                createWriteProvider(
+                        env.getCheckpointConfig(), isStreaming, hasSinkMaterializer(input));
+        writeProvider =
+                StoreSinkWrite.withBlobDescriptorReaderFactory(
+                        writeProvider, blobDescriptorReaderFactory);
+
+        SingleOutputStreamOperator<Committable> written =
+                input.transform(
+                        (writeOnly ? WRITER_WRITE_ONLY_NAME : WRITER_NAME) + " : " + table.name(),
+                        new CommittableTypeInfo(),
+                        createWriteOperatorFactory(writeProvider, commitUser));
+        if (parallelism == null) {
+            forwardParallelism(written, input);
+        } else {
+            written.setParallelism(parallelism);
+        }
+
+        Options options = Options.fromMap(table.options());
+
+        String uidSuffix = options.get(SINK_OPERATOR_UID_SUFFIX);
+        if (options.get(SINK_OPERATOR_UID_SUFFIX) != null) {
+            written = written.uid(generateCustomUid(WRITER_NAME, table.name(), uidSuffix));
+        }
+
+        if (options.get(SINK_USE_MANAGED_MEMORY)) {
+            declareManagedMemory(written, options.get(SINK_MANAGED_WRITER_BUFFER_MEMORY));
+        }
+
+        configureSlotSharingGroup(
+                written, options.get(SINK_WRITER_CPU), options.get(SINK_WRITER_MEMORY));
+
+        if (!table.primaryKeys().isEmpty() && options.get(PRECOMMIT_COMPACT)) {
+            SingleOutputStreamOperator<Committable> beforeSort =
+                    written.transform(
+                                    "Changelog Compact Coordinator",
+                                    new EitherTypeInfo<>(
+                                            new CommittableTypeInfo(), new ChangelogTaskTypeInfo()),
+                                    new ChangelogCompactCoordinateOperator(table.coreOptions()))
+                            .forceNonParallel()
+                            .transform(
+                                    "Changelog Compact Worker",
+                                    new CommittableTypeInfo(),
+                                    new ChangelogCompactWorkerOperator(table));
+            forwardParallelism(beforeSort, written);
+
+            written =
+                    beforeSort
+                            .transform(
+                                    "Changelog Sort by Creation Time",
+                                    new CommittableTypeInfo(),
+                                    new ChangelogCompactSortOperator())
+                            .forceNonParallel();
+        }
+
+        return written;
+    }
+
+    protected boolean writeOnly() {
+        return table.coreOptions().writeOnly();
+    }
+
+    protected StoreSinkWrite.Provider createWriteProvider(
+            CheckpointConfig checkpointConfig, boolean isStreaming, boolean hasSinkMaterializer) {
+        return StoreSinkWrite.createWriteProvider(
+                table, checkpointConfig, isStreaming, ignorePreviousFiles, hasSinkMaterializer);
+    }
+
+    protected boolean ignorePreviousFiles() {
+        return ignorePreviousFiles;
+    }
+
+    public DataStreamSink<?> doCommit(DataStream<Committable> written, String commitUser) {
+        StreamExecutionEnvironment env = written.getExecutionEnvironment();
+        CheckpointConfig checkpointConfig = env.getCheckpointConfig();
+        boolean streamingCheckpointEnabled =
+                isStreaming(written) && checkpointConfig.isCheckpointingEnabled();
+        boolean coordinatorCommitEnabled = coordinatorCommitEnabled();
+        if (streamingCheckpointEnabled) {
+            assertStreamingConfiguration(env, coordinatorCommitEnabled);
+        }
+
+        if (coordinatorCommitEnabled) {
+            return doCoordinatorCommit(written, checkpointConfig, streamingCheckpointEnabled);
+        }
+        return doOperatorCommit(written, commitUser, streamingCheckpointEnabled);
+    }
+
+    private DataStreamSink<?> doCoordinatorCommit(
+            DataStream<Committable> written,
+            CheckpointConfig checkpointConfig,
+            boolean streamingCheckpointEnabled) {
+        checkCoordinatorCommitPreconditions(table, checkpointConfig, streamingCheckpointEnabled);
+        // The commit runs inside the writer's OperatorCoordinator on the JobManager, so there
+        // is no global committer operator. Committables are still forwarded by the writer for
+        // observability and are discarded here.
+        return written.sinkTo(new PaimonDiscardingSink<>(table))
+                .name("end")
+                .setParallelism(written.getParallelism());
+    }
+
+    private DataStreamSink<?> doOperatorCommit(
+            DataStream<Committable> written,
+            String commitUser,
+            boolean streamingCheckpointEnabled) {
+        ReadableConfig conf = written.getExecutionEnvironment().getConfiguration();
+        Options options = Options.fromMap(table.options());
+
+        OneInputStreamOperatorFactory<Committable, Committable> committerOperator =
+                createCommitterOperatorFactory(
+                        streamingCheckpointEnabled, commitUser, options.get(END_INPUT_WATERMARK));
+
+        if (options.get(SINK_AUTO_TAG_FOR_SAVEPOINT)) {
+            committerOperator =
+                    new AutoTagForSavepointCommitterOperatorFactory<>(
+                            (CommitterOperatorFactory<Committable, ManifestCommittable>)
+                                    committerOperator,
+                            table::snapshotManager,
+                            table::tagManager,
+                            () -> table.store().newTagDeletion(),
+                            () -> table.store().createTagCallbacks(table),
+                            table.coreOptions().tagDefaultTimeRetained());
+        }
+        if (conf.get(ExecutionOptions.RUNTIME_MODE) == RuntimeExecutionMode.BATCH
+                && table.coreOptions().tagCreationMode() == TagCreationMode.BATCH) {
+            committerOperator =
+                    new BatchWriteGeneratorTagOperatorFactory<>(
+                            (CommitterOperatorFactory<Committable, ManifestCommittable>)
+                                    committerOperator,
+                            table);
+        }
+        SingleOutputStreamOperator<?> committed =
+                written.transform(
+                                GLOBAL_COMMITTER_NAME + " : " + table.name(),
+                                new CommittableTypeInfo(),
+                                committerOperator)
+                        .setParallelism(1)
+                        .setMaxParallelism(1);
+        if (options.get(SINK_OPERATOR_UID_SUFFIX) != null) {
+            committed =
+                    committed.uid(
+                            generateCustomUid(
+                                    GLOBAL_COMMITTER_NAME,
+                                    table.name(),
+                                    options.get(SINK_OPERATOR_UID_SUFFIX)));
+        }
+        if (!options.get(SINK_COMMITTER_OPERATOR_CHAINING)) {
+            committed = committed.startNewChain();
+        }
+        configureSlotSharingGroup(
+                committed, options.get(SINK_COMMITTER_CPU), options.get(SINK_COMMITTER_MEMORY));
+        return committed.sinkTo(new PaimonDiscardingSink<>(table)).name("end").setParallelism(1);
+    }
+
+    public static void configureSlotSharingGroup(
+            SingleOutputStreamOperator<?> operator,
+            double cpuCores,
+            @Nullable MemorySize heapMemory) {
+        if (heapMemory == null) {
+            return;
+        }
+
+        SlotSharingGroup slotSharingGroup =
+                SlotSharingGroup.newBuilder(operator.getName())
+                        .setCpuCores(cpuCores)
+                        .setTaskHeapMemory(
+                                new org.apache.flink.configuration.MemorySize(
+                                        heapMemory.getBytes()))
+                        .build();
+        operator.slotSharingGroup(slotSharingGroup);
+    }
+
+    public static void assertStreamingConfiguration(StreamExecutionEnvironment env) {
+        assertStreamingConfiguration(env, false);
+    }
+
+    private static void assertStreamingConfiguration(
+            StreamExecutionEnvironment env, boolean supportsUnalignedCheckpoints) {
+        checkArgument(
+                supportsUnalignedCheckpoints
+                        || !env.getCheckpointConfig().isUnalignedCheckpointsEnabled(),
+                "Paimon sink currently does not support unaligned checkpoints. Please set "
+                        + "execution.checkpointing.unaligned.enabled to false.");
+        checkArgument(
+                env.getCheckpointConfig().getCheckpointingMode() == CheckpointingMode.EXACTLY_ONCE,
+                "Paimon sink currently only supports EXACTLY_ONCE checkpoint mode. Please set "
+                        + "execution.checkpointing.mode to exactly-once");
+    }
+
+    public static void assertBatchAdaptiveParallelism(
+            StreamExecutionEnvironment env, int sinkParallelism) {
+        String msg =
+                "Paimon Sink does not support Flink's Adaptive Parallelism mode. "
+                        + "Please manually turn it off or set Paimon `sink.parallelism` manually.";
+        assertBatchAdaptiveParallelism(env, sinkParallelism, msg);
+    }
+
+    public static void assertBatchAdaptiveParallelism(
+            StreamExecutionEnvironment env, int sinkParallelism, String exceptionMsg) {
+        try {
+            checkArgument(
+                    sinkParallelism != -1 || !AdaptiveParallelism.isEnabled(env), exceptionMsg);
+        } catch (NoClassDefFoundError ignored) {
+            // before 1.17, there is no adaptive parallelism
+        }
+    }
+
+    protected CommitterOperatorFactory<Committable, ManifestCommittable>
+            createCommitterOperatorFactory(
+                    boolean streamingCheckpointEnabled,
+                    String commitUser,
+                    @Nullable Long endInputWatermark) {
+        return new CommitterOperatorFactory<>(
+                streamingCheckpointEnabled,
+                true,
+                commitUser,
+                createCommitterFactory(),
+                createCommittableStateManager(),
+                endInputWatermark);
+    }
+
+    protected abstract OneInputStreamOperatorFactory<T, Committable> createWriteOperatorFactory(
+            StoreSinkWrite.Provider writeProvider, String commitUser);
+
+    protected abstract Committer.Factory<Committable, ManifestCommittable> createCommitterFactory();
+
+    protected abstract CommittableStateManager<ManifestCommittable> createCommittableStateManager();
+
+    /**
+     * Whether the writer commits through its {@link
+     * org.apache.flink.runtime.operators.coordination.OperatorCoordinator} on the JobManager. When
+     * {@code true}, {@link #doCommit} skips the global committer operator. Sinks that wire a
+     * coordinated writer factory override this.
+     */
+    protected boolean coordinatorCommitEnabled() {
+        return false;
+    }
+
+    /**
+     * Fails fast when coordinator commit is enabled together with a table property or runtime
+     * setting it cannot honor yet. Enabling coordinator commit is an explicit user choice, so a
+     * conflicting configuration is reported instead of silently falling back to the global
+     * committer.
+     */
+    @VisibleForTesting
+    static void checkCoordinatorCommitPreconditions(
+            FileStoreTable table,
+            CheckpointConfig checkpointConfig,
+            boolean streamingCheckpointEnabled) {
+        Options options = Options.fromMap(table.options());
+
+        // Region failover only benefits streaming jobs. A batch job persists its shuffle data and
+        // has no region-failover concern, so coordinator commit brings no benefit and batch is not
+        // supported. The commit is driven by checkpoint completion, so checkpointing must be on.
+        checkArgument(
+                streamingCheckpointEnabled,
+                "Could not enable coordinator commit because it requires streaming mode with checkpointing enabled.");
+
+        // The checks below reject configurations that introduce an all-to-all shuffle. Such a
+        // shuffle places every operator into a single failover region, which defeats the region
+        // failover that coordinator commit is meant to enable.
+        checkArgument(
+                table.primaryKeys().isEmpty(),
+                "Could not enable coordinator commit because only append tables are supported, but the table has primary keys.");
+        checkArgument(
+                table.bucketMode() == BucketMode.BUCKET_UNAWARE,
+                "Could not enable coordinator commit because bucket mode is "
+                        + table.bucketMode()
+                        + ", only unaware bucket is supported.");
+        checkArgument(
+                table.coreOptions().writeOnly(),
+                "Could not enable coordinator commit because it requires "
+                        + WRITE_ONLY.key()
+                        + " = true.");
+        checkArgument(
+                !options.get(PRECOMMIT_COMPACT),
+                "Could not enable coordinator commit because it requires "
+                        + PRECOMMIT_COMPACT.key()
+                        + " = false.");
+
+        // TODO concurrent checkpoints are not supported yet.
+        checkArgument(
+                checkpointConfig.getMaxConcurrentCheckpoints() == 1,
+                "Could not enable coordinator commit because execution.checkpointing.max-concurrent-checkpoints is "
+                        + checkpointConfig.getMaxConcurrentCheckpoints()
+                        + ", which is not supported yet.");
+    }
+
+    public static boolean isStreaming(DataStream<?> input) {
+        return isStreaming(input.getExecutionEnvironment());
+    }
+
+    public static boolean isStreaming(StreamExecutionEnvironment env) {
+        return env.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
+                == RuntimeExecutionMode.STREAMING;
+    }
+}

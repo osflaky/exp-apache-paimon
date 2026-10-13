@@ -1,0 +1,601 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink;
+
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.Blob;
+import org.apache.paimon.data.BlobDescriptor;
+import org.apache.paimon.data.Decimal;
+import org.apache.paimon.data.InternalArray;
+import org.apache.paimon.data.InternalMap;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.InternalVector;
+import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.data.variant.GenericVariant;
+import org.apache.paimon.data.variant.Variant;
+import org.apache.paimon.rest.HttpClientUtils;
+import org.apache.paimon.types.DataTypeRoot;
+import org.apache.paimon.types.RowKind;
+import org.apache.paimon.utils.SensitiveConfigUtils;
+import org.apache.paimon.utils.UriReaderFactory;
+
+import org.apache.flink.table.data.DecimalData;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
+import static org.apache.paimon.flink.FlinkRowData.toFlinkRowKind;
+import static org.apache.paimon.flink.LogicalTypeConversion.toDataType;
+
+/** Convert from Flink row data. */
+public class FlinkRowWrapper implements InternalRow {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FlinkRowWrapper.class);
+
+    private final org.apache.flink.table.data.RowData row;
+    private final UriReaderFactory uriReaderFactory;
+    private final boolean checkBlobDescriptorExists;
+    private final boolean writeNullOnFetchFailure;
+    private final Set<Integer> blobFields;
+    private final Set<Integer> materializedBlobFields;
+
+    public FlinkRowWrapper(org.apache.flink.table.data.RowData row) {
+        this(row, null);
+    }
+
+    public FlinkRowWrapper(org.apache.flink.table.data.RowData row, CatalogContext catalogContext) {
+        this(row, catalogContext, false);
+    }
+
+    public FlinkRowWrapper(
+            org.apache.flink.table.data.RowData row,
+            CatalogContext catalogContext,
+            boolean checkBlobDescriptorExists) {
+        this(row, catalogContext, checkBlobDescriptorExists, false, Collections.emptySet());
+    }
+
+    public FlinkRowWrapper(
+            org.apache.flink.table.data.RowData row,
+            CatalogContext catalogContext,
+            boolean checkBlobDescriptorExists,
+            boolean writeNullOnFetchFailure) {
+        this(
+                row,
+                catalogContext,
+                checkBlobDescriptorExists,
+                writeNullOnFetchFailure,
+                Collections.emptySet());
+    }
+
+    public FlinkRowWrapper(
+            org.apache.flink.table.data.RowData row,
+            CatalogContext catalogContext,
+            boolean checkBlobDescriptorExists,
+            Set<Integer> blobFields) {
+        this(row, catalogContext, checkBlobDescriptorExists, false, blobFields);
+    }
+
+    public FlinkRowWrapper(
+            org.apache.flink.table.data.RowData row,
+            CatalogContext catalogContext,
+            boolean checkBlobDescriptorExists,
+            boolean writeNullOnFetchFailure,
+            Set<Integer> blobFields) {
+        this(
+                row,
+                new UriReaderFactory(catalogContext),
+                checkBlobDescriptorExists,
+                writeNullOnFetchFailure,
+                blobFields,
+                Collections.emptySet());
+    }
+
+    public static FlinkRowWrapper fromUriReaderFactory(
+            org.apache.flink.table.data.RowData row,
+            UriReaderFactory uriReaderFactory,
+            boolean checkBlobDescriptorExists,
+            boolean writeNullOnFetchFailure,
+            Set<Integer> blobFields) {
+        return fromUriReaderFactory(
+                row,
+                uriReaderFactory,
+                checkBlobDescriptorExists,
+                writeNullOnFetchFailure,
+                blobFields,
+                Collections.emptySet());
+    }
+
+    public static FlinkRowWrapper fromUriReaderFactory(
+            org.apache.flink.table.data.RowData row,
+            UriReaderFactory uriReaderFactory,
+            boolean checkBlobDescriptorExists,
+            boolean writeNullOnFetchFailure,
+            Set<Integer> blobFields,
+            Set<Integer> materializedBlobFields) {
+        return new FlinkRowWrapper(
+                row,
+                uriReaderFactory,
+                checkBlobDescriptorExists,
+                writeNullOnFetchFailure,
+                blobFields,
+                materializedBlobFields);
+    }
+
+    private FlinkRowWrapper(
+            org.apache.flink.table.data.RowData row,
+            UriReaderFactory uriReaderFactory,
+            boolean checkBlobDescriptorExists,
+            boolean writeNullOnFetchFailure,
+            Set<Integer> blobFields,
+            Set<Integer> materializedBlobFields) {
+        this.row = row;
+        this.uriReaderFactory = uriReaderFactory;
+        this.checkBlobDescriptorExists = checkBlobDescriptorExists;
+        this.writeNullOnFetchFailure = writeNullOnFetchFailure;
+        this.blobFields = blobFields;
+        this.materializedBlobFields = materializedBlobFields;
+    }
+
+    public static Set<Integer> blobFieldIndexes(org.apache.paimon.types.RowType rowType) {
+        Set<Integer> result = new HashSet<>();
+        for (int i = 0; i < rowType.getFieldCount(); i++) {
+            if (rowType.getTypeAt(i).getTypeRoot() == DataTypeRoot.BLOB) {
+                result.add(i);
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public int getFieldCount() {
+        return row.getArity();
+    }
+
+    @Override
+    public RowKind getRowKind() {
+        return fromFlinkRowKind(row.getRowKind());
+    }
+
+    @Override
+    public void setRowKind(RowKind kind) {
+        row.setRowKind(toFlinkRowKind(kind));
+    }
+
+    @Override
+    public boolean isNullAt(int pos) {
+        if (row.isNullAt(pos)) {
+            return true;
+        }
+        if (!checkBlobDescriptorExists || !blobFields.contains(pos)) {
+            return false;
+        }
+        return isMissingBlobDescriptor(pos, row.getBinary(pos));
+    }
+
+    @Override
+    public boolean getBoolean(int pos) {
+        return row.getBoolean(pos);
+    }
+
+    @Override
+    public byte getByte(int pos) {
+        return row.getByte(pos);
+    }
+
+    @Override
+    public short getShort(int pos) {
+        return row.getShort(pos);
+    }
+
+    @Override
+    public int getInt(int pos) {
+        return row.getInt(pos);
+    }
+
+    @Override
+    public long getLong(int pos) {
+        return row.getLong(pos);
+    }
+
+    @Override
+    public float getFloat(int pos) {
+        return row.getFloat(pos);
+    }
+
+    @Override
+    public double getDouble(int pos) {
+        return row.getDouble(pos);
+    }
+
+    @Override
+    public BinaryString getString(int pos) {
+        return fromFlinkString(row.getString(pos));
+    }
+
+    @Override
+    public Decimal getDecimal(int pos, int precision, int scale) {
+        return fromFlinkDecimal(row.getDecimal(pos, precision, scale));
+    }
+
+    @Override
+    public Timestamp getTimestamp(int pos, int precision) {
+        return fromFlinkTimestamp(row.getTimestamp(pos, precision));
+    }
+
+    @Override
+    public byte[] getBinary(int pos) {
+        return row.getBinary(pos);
+    }
+
+    @Override
+    public Variant getVariant(int pos) {
+        org.apache.flink.types.variant.BinaryVariant variant =
+                (org.apache.flink.types.variant.BinaryVariant) row.getVariant(pos);
+        return new GenericVariant(variant.getValue(), variant.getMetadata());
+    }
+
+    @Override
+    public Blob getBlob(int pos) {
+        byte[] bytes = row.getBinary(pos);
+        return Blob.fromBytes(bytes, uriReaderFactory, null);
+    }
+
+    private boolean isMissingBlobDescriptor(int pos, byte[] bytes) {
+        if (!checkBlobDescriptorExists
+                || bytes == null
+                || !BlobDescriptor.isBlobDescriptor(bytes)) {
+            return false;
+        }
+
+        BlobDescriptor descriptor = BlobDescriptor.deserialize(bytes);
+        // Materialized BLOB fields are copied into managed blob files. Their writer has to open
+        // HTTP resources and already maps HTTP 404 and other open failures to NULL according to
+        // the two write-null options. Avoid a redundant HEAD / range-GET existence check before
+        // that required GET. Inline descriptor and view fields keep the existence check because
+        // they have no later writer fetch.
+        if (materializedBlobFields.contains(pos) && isHttpUri(descriptor.uri())) {
+            return false;
+        }
+        return !descriptorFileExists(pos, descriptor);
+    }
+
+    private boolean descriptorFileExists(int pos, BlobDescriptor descriptor) {
+        try {
+            boolean exists = uriReaderFactory.exists(descriptor.uri());
+            if (!exists) {
+                logMissingDescriptor(pos, descriptor);
+            }
+            return exists;
+        } catch (IOException e) {
+            if (deferExistsCheckFailure(e)) {
+                return true;
+            }
+            LOG.warn(
+                    "Failed to check blob descriptor file {} for BLOB field at position {}.",
+                    SensitiveConfigUtils.sanitizeUri(descriptor.uri()),
+                    pos,
+                    e);
+            throw new RuntimeException(e);
+        } catch (RuntimeException e) {
+            if (deferExistsCheckFailure(e)) {
+                return true;
+            }
+            LOG.warn(
+                    "Failed to check blob descriptor file {} for BLOB field at position {}.",
+                    SensitiveConfigUtils.sanitizeUri(descriptor.uri()),
+                    pos,
+                    e);
+            throw e;
+        }
+    }
+
+    private void logMissingDescriptor(int pos, BlobDescriptor descriptor) {
+        if (isHttpUri(descriptor.uri())) {
+            LOG.warn(
+                    "Blob descriptor file {} returned HTTP 404, returning NULL for BLOB field at position {}.",
+                    SensitiveConfigUtils.sanitizeUri(descriptor.uri()),
+                    pos);
+        } else {
+            LOG.warn(
+                    "Blob descriptor file {} does not exist, returning NULL for BLOB field at position {}.",
+                    SensitiveConfigUtils.sanitizeUri(descriptor.uri()),
+                    pos);
+        }
+    }
+
+    private static boolean isHttpUri(String uri) {
+        return uri.regionMatches(true, 0, "http://", 0, "http://".length())
+                || uri.regionMatches(true, 0, "https://", 0, "https://".length());
+    }
+
+    /**
+     * When fetch-failure null write is enabled, non-404 errors during exists pre-check are deferred
+     * to the writer fetch path, so they can be logged and written as NULL.
+     */
+    private boolean deferExistsCheckFailure(Throwable failure) {
+        return writeNullOnFetchFailure && !HttpClientUtils.isNotFoundError(failure);
+    }
+
+    @Override
+    public InternalArray getArray(int pos) {
+        return new FlinkArrayWrapper(row.getArray(pos), uriReaderFactory);
+    }
+
+    @Override
+    public InternalVector getVector(int pos) {
+        return new FlinkVectorWrapper(row.getArray(pos), uriReaderFactory);
+    }
+
+    @Override
+    public InternalMap getMap(int pos) {
+        return new FlinkMapWrapper(row.getMap(pos), uriReaderFactory);
+    }
+
+    @Override
+    public InternalRow getRow(int pos, int numFields) {
+        return new FlinkRowWrapper(row.getRow(pos, numFields));
+    }
+
+    private static class FlinkArrayWrapper implements InternalArray {
+
+        private final org.apache.flink.table.data.ArrayData array;
+        @Nullable private final UriReaderFactory uriReaderFactory;
+
+        private FlinkArrayWrapper(org.apache.flink.table.data.ArrayData array) {
+            this(array, null);
+        }
+
+        private FlinkArrayWrapper(
+                org.apache.flink.table.data.ArrayData array,
+                @Nullable UriReaderFactory uriReaderFactory) {
+            this.array = array;
+            this.uriReaderFactory = uriReaderFactory;
+        }
+
+        @Override
+        public int size() {
+            return array.size();
+        }
+
+        @Override
+        public boolean isNullAt(int pos) {
+            return array.isNullAt(pos);
+        }
+
+        @Override
+        public boolean getBoolean(int pos) {
+            return array.getBoolean(pos);
+        }
+
+        @Override
+        public byte getByte(int pos) {
+            return array.getByte(pos);
+        }
+
+        @Override
+        public short getShort(int pos) {
+            return array.getShort(pos);
+        }
+
+        @Override
+        public int getInt(int pos) {
+            return array.getInt(pos);
+        }
+
+        @Override
+        public long getLong(int pos) {
+            return array.getLong(pos);
+        }
+
+        @Override
+        public float getFloat(int pos) {
+            return array.getFloat(pos);
+        }
+
+        @Override
+        public double getDouble(int pos) {
+            return array.getDouble(pos);
+        }
+
+        @Override
+        public BinaryString getString(int pos) {
+            return fromFlinkString(array.getString(pos));
+        }
+
+        @Override
+        public Decimal getDecimal(int pos, int precision, int scale) {
+            return fromFlinkDecimal(array.getDecimal(pos, precision, scale));
+        }
+
+        @Override
+        public Timestamp getTimestamp(int pos, int precision) {
+            return fromFlinkTimestamp(array.getTimestamp(pos, precision));
+        }
+
+        @Override
+        public byte[] getBinary(int pos) {
+            return array.getBinary(pos);
+        }
+
+        @Override
+        public Variant getVariant(int pos) {
+            org.apache.flink.types.variant.BinaryVariant variant =
+                    (org.apache.flink.types.variant.BinaryVariant) array.getVariant(pos);
+            return new GenericVariant(variant.getValue(), variant.getMetadata());
+        }
+
+        @Override
+        public Blob getBlob(int pos) {
+            return Blob.fromBytes(array.getBinary(pos), uriReaderFactory, null);
+        }
+
+        @Override
+        public InternalArray getArray(int pos) {
+            return new FlinkArrayWrapper(array.getArray(pos), uriReaderFactory);
+        }
+
+        @Override
+        public InternalVector getVector(int pos) {
+            return new FlinkVectorWrapper(array.getArray(pos), uriReaderFactory);
+        }
+
+        @Override
+        public InternalMap getMap(int pos) {
+            return new FlinkMapWrapper(array.getMap(pos), uriReaderFactory);
+        }
+
+        @Override
+        public InternalRow getRow(int pos, int numFields) {
+            return new FlinkRowWrapper(array.getRow(pos, numFields));
+        }
+
+        @Override
+        public boolean[] toBooleanArray() {
+            return array.toBooleanArray();
+        }
+
+        @Override
+        public byte[] toByteArray() {
+            return array.toByteArray();
+        }
+
+        @Override
+        public short[] toShortArray() {
+            return array.toShortArray();
+        }
+
+        @Override
+        public int[] toIntArray() {
+            return array.toIntArray();
+        }
+
+        @Override
+        public long[] toLongArray() {
+            return array.toLongArray();
+        }
+
+        @Override
+        public float[] toFloatArray() {
+            return array.toFloatArray();
+        }
+
+        @Override
+        public double[] toDoubleArray() {
+            return array.toDoubleArray();
+        }
+    }
+
+    private static class FlinkVectorWrapper extends FlinkArrayWrapper implements InternalVector {
+        private FlinkVectorWrapper(org.apache.flink.table.data.ArrayData array) {
+            super(array);
+        }
+
+        private FlinkVectorWrapper(
+                org.apache.flink.table.data.ArrayData array,
+                @Nullable UriReaderFactory uriReaderFactory) {
+            super(array, uriReaderFactory);
+        }
+    }
+
+    private static class FlinkMapWrapper implements InternalMap {
+
+        private final org.apache.flink.table.data.MapData map;
+        @Nullable private final UriReaderFactory uriReaderFactory;
+
+        private FlinkMapWrapper(org.apache.flink.table.data.MapData map) {
+            this(map, null);
+        }
+
+        private FlinkMapWrapper(
+                org.apache.flink.table.data.MapData map,
+                @Nullable UriReaderFactory uriReaderFactory) {
+            this.map = map;
+            this.uriReaderFactory = uriReaderFactory;
+        }
+
+        @Override
+        public int size() {
+            return map.size();
+        }
+
+        @Override
+        public InternalArray keyArray() {
+            return new FlinkArrayWrapper(map.keyArray(), uriReaderFactory);
+        }
+
+        @Override
+        public InternalArray valueArray() {
+            return new FlinkArrayWrapper(map.valueArray(), uriReaderFactory);
+        }
+    }
+
+    public static BinaryString fromFlinkString(StringData str) {
+        return BinaryString.fromBytes(str.toBytes());
+    }
+
+    public static Timestamp fromFlinkTimestamp(
+            org.apache.flink.table.data.TimestampData timestamp) {
+        return Timestamp.fromEpochMillis(
+                timestamp.getMillisecond(), timestamp.getNanoOfMillisecond());
+    }
+
+    public static Decimal fromFlinkDecimal(DecimalData decimal) {
+        if (decimal.isCompact()) {
+            return Decimal.fromUnscaledLong(
+                    decimal.toUnscaledLong(), decimal.precision(), decimal.scale());
+        } else {
+            return Decimal.fromBigDecimal(
+                    decimal.toBigDecimal(), decimal.precision(), decimal.scale());
+        }
+    }
+
+    public static RowKind fromFlinkRowKind(org.apache.flink.types.RowKind rowKind) {
+        switch (rowKind) {
+            case INSERT:
+                return RowKind.INSERT;
+            case UPDATE_BEFORE:
+                return RowKind.UPDATE_BEFORE;
+            case UPDATE_AFTER:
+                return RowKind.UPDATE_AFTER;
+            case DELETE:
+                return RowKind.DELETE;
+            default:
+                throw new UnsupportedOperationException();
+        }
+    }
+
+    public static Object fromFlinkObject(Object o, LogicalType type) {
+        if (o == null) {
+            return null;
+        }
+
+        return InternalRow.createFieldGetter(toDataType(type), 0)
+                .getFieldOrNull(new FlinkRowWrapper(GenericRowData.of(o)));
+    }
+}

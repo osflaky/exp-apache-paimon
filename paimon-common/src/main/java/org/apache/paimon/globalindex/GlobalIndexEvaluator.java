@@ -1,0 +1,411 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.globalindex;
+
+import org.apache.paimon.predicate.And;
+import org.apache.paimon.predicate.CompoundPredicate;
+import org.apache.paimon.predicate.FieldRef;
+import org.apache.paimon.predicate.GreaterOrEqual;
+import org.apache.paimon.predicate.GreaterThan;
+import org.apache.paimon.predicate.IsNaN;
+import org.apache.paimon.predicate.IsNotNull;
+import org.apache.paimon.predicate.LeafBinaryFunction;
+import org.apache.paimon.predicate.LeafFunction;
+import org.apache.paimon.predicate.LeafNAryFunction;
+import org.apache.paimon.predicate.LeafPredicate;
+import org.apache.paimon.predicate.LeafTernaryFunction;
+import org.apache.paimon.predicate.LessOrEqual;
+import org.apache.paimon.predicate.LessThan;
+import org.apache.paimon.predicate.Or;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.IOUtils;
+
+import javax.annotation.Nullable;
+
+import java.io.Closeable;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Function;
+import java.util.function.IntFunction;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+
+/** Predicate for filtering data using global indexes. */
+public class GlobalIndexEvaluator implements Closeable {
+
+    private final RowType rowType;
+    private final IntFunction<Collection<GlobalIndexReader>> readersFunction;
+    private final Map<Integer, Collection<GlobalIndexReader>> indexReadersCache;
+    private final ContainsRefinementEvaluator containsRefinementEvaluator;
+
+    public GlobalIndexEvaluator(
+            RowType rowType, IntFunction<Collection<GlobalIndexReader>> readersFunction) {
+        this.rowType = rowType;
+        this.readersFunction = readersFunction;
+        this.indexReadersCache = new ConcurrentHashMap<>();
+        this.containsRefinementEvaluator =
+                new ContainsRefinementEvaluator(
+                        rowType,
+                        fieldId ->
+                                indexReadersCache.computeIfAbsent(fieldId, readersFunction::apply),
+                        this::visitAsync,
+                        this::combineResults);
+    }
+
+    public Optional<GlobalIndexResult> evaluate(@Nullable Predicate predicate) {
+        return await(evaluateAsync(predicate));
+    }
+
+    /**
+     * Evaluate the predicate asynchronously. Keep this evaluator open until the future completes.
+     */
+    public CompletableFuture<Optional<GlobalIndexResult>> evaluateAsync(
+            @Nullable Predicate predicate) {
+        if (predicate == null) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        return visitAsync(predicate).thenApply(result -> result.map(Evaluation::result));
+    }
+
+    /** Evaluate the predicate and return the fields whose supported indexes contributed. */
+    public Optional<Evaluation> evaluateWithContributingFields(@Nullable Predicate predicate) {
+        if (predicate == null) {
+            return Optional.empty();
+        }
+        return await(visitAsync(predicate));
+    }
+
+    public Optional<GlobalIndexResult> evaluateTopN(TopN topN) {
+        FieldRef fieldRef = topN.orders().get(0).field();
+        int fieldId = rowType.getField(fieldRef.name()).id();
+        Collection<GlobalIndexReader> readers =
+                indexReadersCache.computeIfAbsent(fieldId, readersFunction::apply);
+
+        if (readers.isEmpty()) {
+            return Optional.empty();
+        }
+        checkArgument(readers.size() == 1, "TopN expects one aggregated global index reader.");
+        return await(readers.iterator().next().visitTopN(topN));
+    }
+
+    private <T> T await(CompletableFuture<T> future) {
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted during index evaluation", e);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof RuntimeException) {
+                throw (RuntimeException) e.getCause();
+            }
+            if (e.getCause() instanceof Error) {
+                throw (Error) e.getCause();
+            }
+            throw new RuntimeException(e.getCause());
+        }
+    }
+
+    private CompletableFuture<Optional<Evaluation>> visitAsync(Predicate predicate) {
+        if (predicate instanceof LeafPredicate) {
+            return visitLeafAsync((LeafPredicate) predicate);
+        }
+        return visitCompoundAsync((CompoundPredicate) predicate);
+    }
+
+    private CompletableFuture<Optional<Evaluation>> visitLeafAsync(LeafPredicate predicate) {
+        Optional<FieldRef> fieldRefOptional = predicate.fieldRefOptional();
+        if (!fieldRefOptional.isPresent()) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        FieldRef fieldRef = fieldRefOptional.get();
+        return visitFieldAsync(
+                fieldRef,
+                reader -> predicate.function().visit(reader, fieldRef, predicate.literals()));
+    }
+
+    private CompletableFuture<Optional<Evaluation>> visitFieldAsync(
+            FieldRef fieldRef,
+            Function<GlobalIndexReader, CompletableFuture<Optional<GlobalIndexResult>>> visitor) {
+        int fieldId = rowType.getField(fieldRef.name()).id();
+        Collection<GlobalIndexReader> readers =
+                indexReadersCache.computeIfAbsent(fieldId, readersFunction::apply);
+
+        List<CompletableFuture<Optional<GlobalIndexResult>>> readerFutures =
+                new ArrayList<>(readers.size());
+        for (GlobalIndexReader reader : readers) {
+            readerFutures.add(visitor.apply(reader));
+        }
+
+        return CompletableFuture.allOf(readerFutures.toArray(new CompletableFuture[0]))
+                .thenApply(
+                        v -> {
+                            Optional<GlobalIndexResult> compoundResult = Optional.empty();
+                            for (CompletableFuture<Optional<GlobalIndexResult>> f : readerFutures) {
+                                Optional<GlobalIndexResult> childResult = f.join();
+                                if (!childResult.isPresent()) {
+                                    continue;
+                                }
+                                if (compoundResult.isPresent()) {
+                                    compoundResult =
+                                            Optional.of(
+                                                    compoundResult.get().and(childResult.get()));
+                                } else {
+                                    compoundResult = childResult;
+                                }
+                                if (compoundResult.get().results().isEmpty()) {
+                                    break;
+                                }
+                            }
+                            return compoundResult.map(
+                                    result ->
+                                            new Evaluation(result, Collections.singleton(fieldId)));
+                        });
+    }
+
+    private CompletableFuture<Optional<Evaluation>> visitCompoundAsync(
+            CompoundPredicate predicate) {
+        List<Predicate> children =
+                pruneRedundantIsNotNullForAnd(flattenChildren(predicate), predicate);
+        CompletableFuture<Optional<Evaluation>> refined =
+                containsRefinementEvaluator.evaluate(children, predicate);
+        if (refined != null) {
+            return refined;
+        }
+        List<CompletableFuture<Optional<Evaluation>>> childFutures =
+                new ArrayList<>(children.size());
+        for (int i = 0; i < children.size(); i++) {
+            Predicate child = children.get(i);
+            CompletableFuture<Optional<Evaluation>> range = null;
+            if (predicate.function() instanceof And && isRangeBound(child)) {
+                LeafPredicate first = (LeafPredicate) child;
+                // ponytail: pair search is quadratic in filter count; group by field for large
+                // conjunctions.
+                for (int j = i + 1; j < children.size(); j++) {
+                    Predicate other = children.get(j);
+                    if (!isRangeBound(other)) {
+                        continue;
+                    }
+                    LeafPredicate second = (LeafPredicate) other;
+                    if (isLowerBound(first) == isLowerBound(second)
+                            || !first.fieldRefOptional().equals(second.fieldRefOptional())) {
+                        continue;
+                    }
+                    LeafPredicate lower = isLowerBound(first) ? first : second;
+                    LeafPredicate upper = isLowerBound(first) ? second : first;
+                    FieldRef field = first.fieldRefOptional().get();
+                    range =
+                            visitFieldAsync(
+                                    field,
+                                    reader ->
+                                            reader.visitRange(
+                                                    field,
+                                                    lower.literals().get(0),
+                                                    upper.literals().get(0),
+                                                    lower.function() instanceof GreaterOrEqual,
+                                                    upper.function() instanceof LessOrEqual));
+                    children.remove(j);
+                    break;
+                }
+            }
+            childFutures.add(range == null ? visitAsync(child) : range);
+        }
+
+        return CompletableFuture.allOf(childFutures.toArray(new CompletableFuture[0]))
+                .thenApply(
+                        v -> {
+                            List<Optional<Evaluation>> results = new ArrayList<>();
+                            for (CompletableFuture<Optional<Evaluation>> f : childFutures) {
+                                results.add(f.join());
+                            }
+                            return combineResults(results, predicate);
+                        });
+    }
+
+    private static boolean isRangeBound(Predicate predicate) {
+        if (!(predicate instanceof LeafPredicate)) {
+            return false;
+        }
+        LeafPredicate leaf = (LeafPredicate) predicate;
+        return leaf.fieldRefOptional().isPresent()
+                && (isLowerBound(leaf)
+                        || leaf.function() instanceof LessThan
+                        || leaf.function() instanceof LessOrEqual)
+                && leaf.literals().get(0) != null;
+    }
+
+    private static boolean isLowerBound(LeafPredicate leaf) {
+        return leaf.function() instanceof GreaterThan || leaf.function() instanceof GreaterOrEqual;
+    }
+
+    private Optional<Evaluation> combineResults(
+            List<Optional<Evaluation>> results, CompoundPredicate predicate) {
+        Set<Integer> contributingFieldIds = new HashSet<>();
+        if (predicate.function() instanceof Or) {
+            GlobalIndexResult compoundResult = GlobalIndexResult.createEmpty();
+            for (Optional<Evaluation> child : results) {
+                if (!child.isPresent()) {
+                    return Optional.empty();
+                }
+                compoundResult = compoundResult.or(child.get().result());
+                contributingFieldIds.addAll(child.get().contributingFieldIds());
+            }
+            return Optional.of(new Evaluation(compoundResult, contributingFieldIds));
+        } else {
+            Optional<GlobalIndexResult> compoundResult = Optional.empty();
+            for (Optional<Evaluation> child : results) {
+                if (child.isPresent()) {
+                    if (compoundResult.isPresent()) {
+                        compoundResult =
+                                Optional.of(compoundResult.get().and(child.get().result()));
+                    } else {
+                        compoundResult = Optional.of(child.get().result());
+                    }
+                    contributingFieldIds.addAll(child.get().contributingFieldIds());
+                }
+                if (compoundResult.isPresent() && compoundResult.get().results().isEmpty()) {
+                    break;
+                }
+            }
+            return compoundResult.map(result -> new Evaluation(result, contributingFieldIds));
+        }
+    }
+
+    /**
+     * Matches and fields whose supported index results contributed; discarded branches excluded.
+     */
+    public static final class Evaluation {
+
+        private final GlobalIndexResult result;
+        private final Set<Integer> contributingFieldIds;
+
+        Evaluation(GlobalIndexResult result, Collection<Integer> contributingFieldIds) {
+            this.result = result;
+            this.contributingFieldIds =
+                    Collections.unmodifiableSet(new HashSet<>(contributingFieldIds));
+        }
+
+        public GlobalIndexResult result() {
+            return result;
+        }
+
+        public Set<Integer> contributingFieldIds() {
+            return contributingFieldIds;
+        }
+    }
+
+    private List<Predicate> flattenChildren(CompoundPredicate predicate) {
+        List<Predicate> result = new ArrayList<>();
+        Deque<Predicate> stack = new ArrayDeque<>(predicate.children());
+        while (!stack.isEmpty()) {
+            Predicate child = stack.pollFirst();
+            if (child instanceof CompoundPredicate) {
+                CompoundPredicate compound = (CompoundPredicate) child;
+                if (compound.function().equals(predicate.function())) {
+                    List<Predicate> grandChildren = compound.children();
+                    for (int i = grandChildren.size() - 1; i >= 0; i--) {
+                        stack.addFirst(grandChildren.get(i));
+                    }
+                    continue;
+                }
+            }
+            result.add(child);
+        }
+        return result;
+    }
+
+    private List<Predicate> pruneRedundantIsNotNullForAnd(
+            List<Predicate> children, CompoundPredicate predicate) {
+        if (predicate.function() instanceof Or) {
+            return children;
+        }
+
+        // Only a null-rejecting sibling makes "f IS NOT NULL" redundant. A predicate such as
+        // "f IS NULL" must NOT count here: pruning IS NOT NULL from "f IS NULL AND f IS NOT NULL"
+        // would turn the empty result into the set of null rows. So we whitelist explicitly
+        // null-rejecting predicates instead of treating every non-IsNotNull leaf as constraining.
+        Set<String> constrainedFields = new HashSet<>();
+        for (Predicate child : children) {
+            if (!isNullRejecting(child)) {
+                continue;
+            }
+            Optional<FieldRef> fieldRef = ((LeafPredicate) child).fieldRefOptional();
+            fieldRef.ifPresent(ref -> constrainedFields.add(ref.name()));
+        }
+        if (constrainedFields.isEmpty()) {
+            return children;
+        }
+
+        List<Predicate> pruned = new ArrayList<>(children.size());
+        for (Predicate child : children) {
+            if (isIsNotNull(child)) {
+                Optional<FieldRef> fieldRef = ((LeafPredicate) child).fieldRefOptional();
+                if (fieldRef.isPresent() && constrainedFields.contains(fieldRef.get().name())) {
+                    continue;
+                }
+            }
+            pruned.add(child);
+        }
+        return pruned;
+    }
+
+    private boolean isIsNotNull(Predicate predicate) {
+        return predicate instanceof LeafPredicate
+                && ((LeafPredicate) predicate).function() instanceof IsNotNull;
+    }
+
+    /**
+     * A predicate is null-rejecting when it cannot match a row whose tested field is null. Under
+     * SQL three-valued logic every comparison/match predicate (=, &lt;&gt;, &lt;, &gt;, IN, NOT IN,
+     * BETWEEN, LIKE, ...) and IS NaN reject null; only IS NULL accepts it (and IS NOT NULL is the
+     * predicate we are deciding whether to prune). We whitelist by arity base class so future
+     * comparison functions are covered automatically without re-introducing the IS NULL hazard.
+     */
+    private boolean isNullRejecting(Predicate predicate) {
+        if (!(predicate instanceof LeafPredicate)) {
+            return false;
+        }
+        LeafFunction function = ((LeafPredicate) predicate).function();
+        return function instanceof LeafBinaryFunction
+                || function instanceof LeafNAryFunction
+                || function instanceof LeafTernaryFunction
+                || function instanceof IsNaN;
+    }
+
+    @Override
+    public void close() {
+        IOUtils.closeAllQuietly(
+                indexReadersCache.values().stream()
+                        .flatMap(Collection::stream)
+                        .collect(Collectors.toList()));
+    }
+}

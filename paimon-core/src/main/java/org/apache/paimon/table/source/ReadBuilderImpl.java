@@ -1,0 +1,411 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.table.source;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.disk.IOManager;
+import org.apache.paimon.metrics.MetricRegistry;
+import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.reader.ReadBatchSizer;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.reader.RecordReader.RecordIterator;
+import org.apache.paimon.table.InnerTable;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.Range;
+import org.apache.paimon.utils.RowRangeIndex;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+import static org.apache.paimon.partition.PartitionPredicate.createPartitionPredicate;
+import static org.apache.paimon.partition.PartitionPredicate.fromPredicate;
+import static org.apache.paimon.utils.Preconditions.checkState;
+
+/** Implementation for {@link ReadBuilder}. */
+public class ReadBuilderImpl implements ReadBuilder {
+
+    private static final long serialVersionUID = 1L;
+
+    private final InnerTable table;
+    private final RowType partitionType;
+    private final String defaultPartitionName;
+    private final boolean queryAuthEnabled;
+
+    private Predicate filter;
+
+    // Keep the legacy field for Java serialization compatibility.
+    private Integer limit = null;
+    private Long longLimit = null;
+    private TopN topN = null;
+
+    private Integer shardIndexOfThisSubtask;
+    private Integer shardNumberOfParallelSubtasks;
+
+    private @Nullable PartitionPredicate partitionFilter;
+
+    private @Nullable Integer specifiedBucket = null;
+    private Filter<Integer> bucketFilter;
+
+    private @Nullable RowType readType;
+    private @Nullable RowRangeIndex rowRangeIndex;
+
+    private boolean dropStats = false;
+
+    public ReadBuilderImpl(InnerTable table) {
+        this.table = table;
+        this.partitionType = table.rowType().project(table.partitionKeys());
+        CoreOptions options = new CoreOptions(table.options());
+        this.defaultPartitionName = options.partitionDefaultName();
+        this.queryAuthEnabled = options.queryAuthEnabled();
+    }
+
+    @Override
+    public String tableName() {
+        return table.name();
+    }
+
+    @Override
+    public RowType readType() {
+        return readType != null ? readType : table.rowType();
+    }
+
+    @Override
+    public ReadBuilder withFilter(Predicate filter) {
+        if (this.filter == null) {
+            this.filter = filter;
+        } else {
+            this.filter = PredicateBuilder.and(this.filter, filter);
+        }
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withPartitionFilter(Map<String, String> partitionSpec) {
+        if (partitionSpec != null) {
+            this.partitionFilter =
+                    fromPredicate(
+                            partitionType,
+                            createPartitionPredicate(
+                                    partitionSpec, partitionType, defaultPartitionName));
+        }
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withPartitionFilter(@Nullable PartitionPredicate partitionPredicate) {
+        this.partitionFilter = partitionPredicate;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withReadType(RowType readType) {
+        this.readType = readType;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withProjection(int[] projection) {
+        if (projection == null) {
+            return this;
+        }
+        return withReadType(table.rowType().project(projection));
+    }
+
+    @Override
+    public ReadBuilder withLimit(int limit) {
+        this.limit = limit;
+        this.longLimit = (long) limit;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withLimit(long limit) {
+        this.longLimit = limit;
+        this.limit = limit >= Integer.MIN_VALUE && limit <= Integer.MAX_VALUE ? (int) limit : null;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withTopN(TopN topN) {
+        this.topN = topN;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withShard(int indexOfThisSubtask, int numberOfParallelSubtasks) {
+        this.shardIndexOfThisSubtask = indexOfThisSubtask;
+        this.shardNumberOfParallelSubtasks = numberOfParallelSubtasks;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withRowRanges(List<Range> indices) {
+        if (indices == null) {
+            this.rowRangeIndex = null;
+            return this;
+        }
+        this.rowRangeIndex = RowRangeIndex.create(indices);
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withRowRangeIndex(RowRangeIndex rowRangeIndex) {
+        this.rowRangeIndex = rowRangeIndex;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withBucket(int bucket) {
+        this.specifiedBucket = bucket;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder withBucketFilter(Filter<Integer> bucketFilter) {
+        this.bucketFilter = bucketFilter;
+        return this;
+    }
+
+    @Override
+    public ReadBuilder dropStats() {
+        this.dropStats = true;
+        return this;
+    }
+
+    @Override
+    public TableScan newScan() {
+        Long limit = effectiveLimit();
+        InnerTableScan tableScan = configureScan(table.newScan());
+        if (limit != null) {
+            tableScan.withLimit(limit);
+        }
+        if (topN != null) {
+            tableScan.withTopN(topN);
+        }
+        return tableScan;
+    }
+
+    @Override
+    public StreamTableScan newStreamScan() {
+        return (StreamTableScan) configureScan(table.newStreamScan());
+    }
+
+    private InnerTableScan configureScan(InnerTableScan scan) {
+        // `filter` may contains partition related predicate, but `partitionFilter` will overwrite
+        // it if `partitionFilter` is not null. So we must avoid to put part of partition filter in
+        // `filter`, another part in `partitionFilter`
+        scan.withFilter(filter)
+                .withReadType(readType)
+                .withPartitionFilter(partitionFilter)
+                .withRowRangeIndex(rowRangeIndex);
+
+        checkState(
+                bucketFilter == null || shardIndexOfThisSubtask == null,
+                "Bucket filter and shard configuration cannot be used together. "
+                        + "Please choose one method to specify the data subset.");
+        if (shardIndexOfThisSubtask != null) {
+            if (scan instanceof DataTableScan) {
+                return ((DataTableScan) scan)
+                        .withShard(shardIndexOfThisSubtask, shardNumberOfParallelSubtasks);
+            } else {
+                throw new UnsupportedOperationException(
+                        "Unsupported table scan type for shard configuring, the scan is: " + scan);
+            }
+        }
+        if (specifiedBucket != null) {
+            scan.withBucket(specifiedBucket);
+        }
+        if (bucketFilter != null) {
+            scan.withBucketFilter(bucketFilter);
+        }
+        if (dropStats) {
+            scan.dropStats();
+        }
+        return scan;
+    }
+
+    @Override
+    public TableRead newRead() {
+        Long limit = effectiveLimit();
+        InnerTableRead read = table.newRead().withFilter(filter);
+        if (readType != null) {
+            read.withReadType(readType);
+        }
+        if (queryAuthEnabled) {
+            // the reader does not evaluate the query filter on an auth-enabled table, so
+            // capping the rows here would cut away rows that actually match
+            if (topN == null && limit != null) {
+                return new LimitTableRead(read, limit, filter != null);
+            }
+            return read;
+        }
+
+        if (topN != null) {
+            read.withTopN(topN);
+        }
+        if (limit != null) {
+            read.withLimit(limit);
+        }
+        return read;
+    }
+
+    @Nullable
+    private Long effectiveLimit() {
+        return longLimit != null ? longLimit : limit == null ? null : limit.longValue();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+        ReadBuilderImpl that = (ReadBuilderImpl) o;
+        return Objects.equals(table.name(), that.table.name())
+                && Objects.equals(filter, that.filter)
+                && Objects.equals(partitionFilter, that.partitionFilter)
+                && Objects.equals(readType, that.readType);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = Objects.hash(table.name(), filter);
+        result = 31 * result + Objects.hash(readType);
+        return result;
+    }
+
+    /**
+     * Limits the delegate's output to {@code limit} rows. Used under query auth to apply the limit
+     * after read-time auth filtering, not before (which could drop authorized rows).
+     */
+    private static class LimitTableRead implements TableRead {
+
+        private final TableRead delegate;
+        private final long limit;
+        // with a filter the reader only evaluates it once executeFilter() is requested;
+        // otherwise the engine does, after this limit, so capping here would drop matches
+        private final boolean filterPresent;
+        private boolean filterExecutedByReader = false;
+
+        private LimitTableRead(TableRead delegate, long limit, boolean filterPresent) {
+            this.delegate = delegate;
+            this.limit = limit;
+            this.filterPresent = filterPresent;
+        }
+
+        @Override
+        public TableRead withMetricRegistry(MetricRegistry registry) {
+            delegate.withMetricRegistry(registry);
+            return this;
+        }
+
+        @Override
+        public TableRead executeFilter() {
+            delegate.executeFilter();
+            this.filterExecutedByReader = true;
+            return this;
+        }
+
+        @Override
+        public TableRead withIOManager(IOManager ioManager) {
+            delegate.withIOManager(ioManager);
+            return this;
+        }
+
+        @Override
+        public TableRead withReadBatchSizer(ReadBatchSizer sizer) {
+            delegate.withReadBatchSizer(sizer);
+            return this;
+        }
+
+        @Override
+        public RecordReader<InternalRow> createReader(Split split) throws IOException {
+            return limit(delegate.createReader(split));
+        }
+
+        @Override
+        public RecordReader<InternalRow> createReader(List<Split> splits) throws IOException {
+            // Limit the merged reader so the cap is global, not per split.
+            return limit(delegate.createReader(splits));
+        }
+
+        @Override
+        public RecordReader<InternalRow> createReader(TableScan.Plan plan) throws IOException {
+            return limit(delegate.createReader(plan));
+        }
+
+        private RecordReader<InternalRow> limit(RecordReader<InternalRow> reader) {
+            if (filterPresent && !filterExecutedByReader) {
+                return reader;
+            }
+            // Stop reading once the limit is reached (return EOF), rather than filtering and
+            // draining the rest of the data.
+            return new RecordReader<InternalRow>() {
+                private long count;
+
+                @Nullable
+                @Override
+                public RecordIterator<InternalRow> readBatch() throws IOException {
+                    if (count >= limit) {
+                        return null;
+                    }
+                    RecordIterator<InternalRow> batch = reader.readBatch();
+                    if (batch == null) {
+                        return null;
+                    }
+                    return new RecordIterator<InternalRow>() {
+                        @Nullable
+                        @Override
+                        public InternalRow next() throws IOException {
+                            if (count >= limit) {
+                                return null;
+                            }
+                            InternalRow row = batch.next();
+                            if (row != null) {
+                                count++;
+                            }
+                            return row;
+                        }
+
+                        @Override
+                        public void releaseBatch() {
+                            batch.releaseBatch();
+                        }
+                    };
+                }
+
+                @Override
+                public void close() throws IOException {
+                    reader.close();
+                }
+            };
+        }
+    }
+}

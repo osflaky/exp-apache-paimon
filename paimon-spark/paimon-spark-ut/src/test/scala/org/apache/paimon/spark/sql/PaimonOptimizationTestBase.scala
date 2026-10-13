@@ -1,0 +1,286 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark.sql
+
+import org.apache.paimon.Snapshot.CommitKind
+import org.apache.paimon.spark.{PaimonScan, PaimonSparkTestBase}
+import org.apache.paimon.spark.catalyst.analysis.expressions.ExpressionHelper
+import org.apache.paimon.spark.catalyst.optimizer.MergePaimonScalarSubqueries
+import org.apache.paimon.spark.catalyst.optimizer.PushDownMapSelectedKeys
+import org.apache.paimon.spark.execution.TruncatePaimonTableWithFilterExec
+
+import org.apache.spark.sql.{DataFrame, PaimonUtils, Row}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, CreateNamedStruct, Literal, NamedExpression}
+import org.apache.spark.sql.catalyst.plans.logical.{CTERelationDef, LogicalPlan, OneRowRelation, WithCTE}
+import org.apache.spark.sql.catalyst.rules.RuleExecutor
+import org.apache.spark.sql.execution.CommandResultExec
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
+import org.apache.spark.sql.functions._
+import org.junit.jupiter.api.Assertions
+
+import scala.collection.immutable
+
+abstract class PaimonOptimizationTestBase extends PaimonSparkTestBase with ExpressionHelper {
+
+  import org.apache.spark.sql.catalyst.dsl.expressions._
+  import org.apache.spark.sql.catalyst.dsl.plans._
+  import testImplicits._
+
+  private object Optimize extends RuleExecutor[LogicalPlan] {
+    val batches: immutable.Seq[Batch] =
+      Batch("MergePaimonScalarSubqueries", Once, MergePaimonScalarSubqueries) :: Nil
+  }
+
+  test("Paimon Optimization: merge scalar subqueries") {
+    // Spark 4.0's scalar subquery plan shape differs from 4.1+: our rule ends up producing a
+    // plain `Project` on 4.0 instead of the `WithCTE` wrapper the assertion expects. The rule
+    // still functions (correct result values) — only the expected plan shape is 4.1+ specific.
+    assume(!gteqSpark4_0 || gteqSpark4_1)
+    withTable("T") {
+
+      spark.sql(s"""
+                   |CREATE TABLE T (a INT, b DOUBLE, c STRING)
+                   |""".stripMargin)
+
+      spark.sql("INSERT INTO T values (1, 11.1, 'x1'), (2, 22.2, 'x2'), (3, 33.3, 'x3')")
+
+      val query = spark.sql(s"""
+                               |SELECT
+                               |  (SELECT COUNT(1) AS cnt FROM T),
+                               |  (SELECT SUM(a) AS sum_a FROM T),
+                               |  (SELECT AVG(b) AS avg_b FROM T)
+                               |""".stripMargin)
+      val optimizedPlan = Optimize.execute(query.queryExecution.analyzed)
+      val id = optimizedPlan.asInstanceOf[WithCTE].cteDefs.head.id.toInt
+
+      val df = PaimonUtils.createDataset(spark, createRelationV2("T"))
+      val mergedSubquery = df
+        .select(
+          toColumn(count(Literal(1))).as("cnt"),
+          toColumn(sum(toExpression(spark, col("a")))).as("sum_a"),
+          toColumn(avg(toExpression(spark, col("b"))).as("avg_b"))
+        )
+        .select(
+          toColumn(
+            CreateNamedStruct(
+              Seq(
+                Literal("cnt"),
+                'cnt,
+                Literal("sum_a"),
+                'sum_a,
+                Literal("avg_b"),
+                'avg_b
+              )).as("mergedValue")))
+      val analyzedMergedSubquery = mergedSubquery.queryExecution.analyzed
+      val correctAnswer = WithCTE(
+        OneRowRelation()
+          .select(
+            extractorExpression(id, analyzedMergedSubquery.output, 0),
+            extractorExpression(id, analyzedMergedSubquery.output, 1),
+            extractorExpression(id, analyzedMergedSubquery.output, 2)
+          ),
+        Seq(definitionNode(analyzedMergedSubquery, id))
+      )
+      // Check the plan applied MergePaimonScalarSubqueries.
+      comparePlans(optimizedPlan.analyze, correctAnswer.analyze)
+
+      // Check the query's result.
+      checkDataset(query.as[(Long, Long, Double)], (3L, 6L, 22.2))
+    }
+  }
+
+  test("Paimon Optimization: paimon scan equals") {
+    withTable("T") {
+      spark.sql(s"CREATE TABLE T (id INT, name STRING, pt STRING) PARTITIONED BY (pt)")
+      spark.sql(s"INSERT INTO T VALUES (1, 'a', 'p1'), (2, 'b', 'p1'), (3, 'c', 'p2')")
+
+      // data filter and partition filter
+      val sqlText = "SELECT * FROM T WHERE id = 1 AND pt = 'p1' LIMIT 1"
+      Assertions.assertEquals(getPaimonScan(sqlText), getPaimonScan(sqlText))
+
+      // topN
+      val sqlText2 = "SELECT id FROM T ORDER BY id ASC NULLS LAST LIMIT 5"
+      Assertions.assertEquals(getPaimonScan(sqlText2), getPaimonScan(sqlText2))
+    }
+  }
+
+  test("Paimon Optimization: map selected-key pushdown only supports shared-shredding map") {
+    withTable("T") {
+      spark.sql("CREATE TABLE T (id INT, attrs MAP<STRING, BIGINT>)")
+
+      val normalMapScan = mapSelectedKeysPaimonScan("SELECT attrs['key1'] FROM T")
+      Assertions.assertTrue(normalMapScan.pushedMapSelectedKeys.isEmpty)
+    }
+
+    withTable("T") {
+      spark.sql("CREATE TABLE T (id INT, profile STRUCT<attrs: MAP<STRING, BIGINT>>)")
+
+      val nestedMapScan = mapSelectedKeysPaimonScan("SELECT profile.attrs['key1'] FROM T")
+      Assertions.assertTrue(nestedMapScan.pushedMapSelectedKeys.isEmpty)
+    }
+
+    withTable("T") {
+      spark.sql("""
+                  |CREATE TABLE T (id INT, attrs MAP<STRING, BIGINT>)
+                  |TBLPROPERTIES (
+                  |  'fields.attrs.map.storage-layout' = 'shared-shredding'
+                  |)
+                  |""".stripMargin)
+
+      val sharedShreddingMapScan =
+        mapSelectedKeysPaimonScan("SELECT attrs['key1'], attrs['key2'] FROM T")
+      Assertions.assertEquals(
+        Map("attrs" -> Seq("key1", "key2")),
+        sharedShreddingMapScan.pushedMapSelectedKeys)
+
+      val delimiterKeyScan = mapSelectedKeysPaimonScan("SELECT attrs['a;b'] FROM T")
+      Assertions.assertTrue(delimiterKeyScan.pushedMapSelectedKeys.isEmpty)
+
+      val metadataPrefixKeyScan =
+        mapSelectedKeysPaimonScan("SELECT attrs['__PAIMON_MAP_SELECTED_KEYS:key1'] FROM T")
+      Assertions.assertTrue(metadataPrefixKeyScan.pushedMapSelectedKeys.isEmpty)
+    }
+  }
+
+  test(s"Paimon Optimization: optimize metadata only delete") {
+    for (useV2Write <- Seq("true", "false")) {
+      withSparkSQLConf("spark.paimon.write.use-v2-write" -> useV2Write) {
+        withTable("t") {
+          sql(s"""
+                 |CREATE TABLE t (id INT, name STRING, pt INT)
+                 |PARTITIONED BY (pt)
+                 |""".stripMargin)
+          sql("INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2)")
+          val df = sql("DELETE FROM t WHERE pt = 1")
+          checkTruncatePaimonTable(df)
+          checkAnswer(sql("SELECT * FROM t ORDER BY id"), Seq(Row(2, "b", 2)))
+        }
+      }
+    }
+  }
+
+  test(s"Paimon Optimization: eval subqueries for delete table with ScalarSubquery") {
+    withPk.foreach(
+      hasPk => {
+        val tblProps = if (hasPk) {
+          s"TBLPROPERTIES ('primary-key'='id, pt')"
+        } else {
+          ""
+        }
+        withTable("t1", "t2") {
+          spark.sql(s"""
+                       |CREATE TABLE t1 (id INT, name STRING, pt INT)
+                       |$tblProps
+                       |PARTITIONED BY (pt)
+                       |""".stripMargin)
+          spark.sql(
+            "INSERT INTO t1 VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 2), (4, 'd', 3), (5, 'e', 4)")
+
+          spark.sql(s"CREATE TABLE t2 (id INT, n INT)")
+          spark.sql("INSERT INTO t2 VALUES (1, 1), (2, 2), (3, 3), (4, 4)")
+
+          val df =
+            spark.sql(s"""DELETE FROM t1 WHERE
+                         |pt >= (SELECT min(id) FROM t2 WHERE n BETWEEN 2 AND 3)
+                         |AND
+                         |pt <= (SELECT max(id) FROM t2 WHERE n BETWEEN 2 AND 3)""".stripMargin)
+          // For partition-only predicates, drop partition is called internally.
+          Assertions.assertEquals(
+            CommitKind.OVERWRITE,
+            loadTable("t1").store().snapshotManager().latestSnapshot().commitKind())
+          checkTruncatePaimonTable(df)
+
+          checkAnswer(
+            spark.sql("SELECT * FROM t1 ORDER BY id"),
+            Row(1, "a", 1) :: Row(5, "e", 4) :: Nil)
+
+          // subquery eval nothing
+          spark.sql(s"""DELETE FROM t1 WHERE
+                       |pt >= (SELECT min(id) FROM t2 WHERE n > 10)""".stripMargin)
+
+          checkAnswer(
+            spark.sql("SELECT * FROM t1 ORDER BY id"),
+            Row(1, "a", 1) :: Row(5, "e", 4) :: Nil)
+        }
+      })
+  }
+
+  test(s"Paimon Optimization: eval subqueries for delete table with InSubquery") {
+    withPk.foreach(
+      hasPk => {
+        val tblProps = if (hasPk) {
+          s"TBLPROPERTIES ('primary-key'='id, pt')"
+        } else {
+          ""
+        }
+        withTable("t1", "t2") {
+          spark.sql(s"""
+                       |CREATE TABLE t1 (id INT, name STRING, pt INT)
+                       |$tblProps
+                       |PARTITIONED BY (pt)
+                       |""".stripMargin)
+          spark.sql(
+            "INSERT INTO t1 VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 2), (4, 'd', 3), (5, 'e', 4)")
+
+          spark.sql(s"CREATE TABLE t2 (id INT, n INT)")
+          spark.sql("INSERT INTO t2 VALUES (1, 1), (2, 2), (3, 3), (4, 4)")
+
+          val df =
+            spark.sql(s"""DELETE FROM t1 WHERE
+                         |pt in (SELECT id FROM t2 WHERE n BETWEEN 2 AND 3)
+                         |OR
+                         |pt in (SELECT max(id) FROM t2 WHERE n BETWEEN 2 AND 3)""".stripMargin)
+          // For partition-only predicates, drop partition is called internally.
+          Assertions.assertEquals(
+            CommitKind.OVERWRITE,
+            loadTable("t1").store().snapshotManager().latestSnapshot().commitKind())
+          checkTruncatePaimonTable(df)
+
+          checkAnswer(
+            spark.sql("SELECT * FROM t1 ORDER BY id"),
+            Row(1, "a", 1) :: Row(5, "e", 4) :: Nil)
+
+          // subquery eval nothing
+          spark.sql(s"""DELETE FROM t1 WHERE
+                       |pt in (SELECT id FROM t2 WHERE n > 10)""".stripMargin)
+
+          checkAnswer(
+            spark.sql("SELECT * FROM t1 ORDER BY id"),
+            Row(1, "a", 1) :: Row(5, "e", 4) :: Nil)
+        }
+      })
+  }
+
+  private def definitionNode(plan: LogicalPlan, cteIndex: Int) = {
+    CTERelationDef(plan, cteIndex, underSubquery = true)
+  }
+
+  def extractorExpression(cteIndex: Int, output: Seq[Attribute], fieldIndex: Int): NamedExpression
+
+  private def mapSelectedKeysPaimonScan(sqlText: String): PaimonScan = {
+    PushDownMapSelectedKeys(sql(sqlText).queryExecution.optimizedPlan).collectFirst {
+      case relation: DataSourceV2ScanRelation => relation.scan.asInstanceOf[PaimonScan]
+    }.get
+  }
+
+  def checkTruncatePaimonTable(df: DataFrame): Unit = {
+    val plan = df.queryExecution.executedPlan.asInstanceOf[CommandResultExec].commandPhysicalPlan
+    assert(plan.isInstanceOf[TruncatePaimonTableWithFilterExec])
+  }
+}

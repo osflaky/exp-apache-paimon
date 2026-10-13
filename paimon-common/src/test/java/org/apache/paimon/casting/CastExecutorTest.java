@@ -1,0 +1,1246 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.casting;
+
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericArray;
+import org.apache.paimon.data.GenericMap;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalArray;
+import org.apache.paimon.data.InternalMap;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.types.ArrayType;
+import org.apache.paimon.types.BigIntType;
+import org.apache.paimon.types.BinaryType;
+import org.apache.paimon.types.BooleanType;
+import org.apache.paimon.types.CharType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.DateType;
+import org.apache.paimon.types.DecimalType;
+import org.apache.paimon.types.DoubleType;
+import org.apache.paimon.types.FloatType;
+import org.apache.paimon.types.IntType;
+import org.apache.paimon.types.LocalZonedTimestampType;
+import org.apache.paimon.types.MapType;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.SmallIntType;
+import org.apache.paimon.types.TimeType;
+import org.apache.paimon.types.TimestampType;
+import org.apache.paimon.types.TinyIntType;
+import org.apache.paimon.types.VarBinaryType;
+import org.apache.paimon.types.VarCharType;
+import org.apache.paimon.utils.DateTimeUtils;
+import org.apache.paimon.utils.DecimalUtils;
+
+import org.junit.jupiter.api.Test;
+
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.TimeZone;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.fail;
+
+/** Test for {@link CastExecutor}. */
+public class CastExecutorTest {
+
+    @Test
+    public void testNumericToNumeric() {
+        // byte to other numeric
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new SmallIntType(false)),
+                (byte) 1,
+                (short) 1);
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new IntType(false)), (byte) 1, 1);
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new BigIntType(false)), (byte) 1, 1L);
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new FloatType(false)), (byte) 1, 1F);
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new DoubleType(false)), (byte) 1, 1D);
+
+        // short to other numeric
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new TinyIntType(false)),
+                (short) 123,
+                (byte) 123);
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new IntType(false)), (short) 1, 1);
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new BigIntType(false)),
+                (short) 1,
+                1L);
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new FloatType(false)),
+                (short) 1,
+                1F);
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new DoubleType(false)),
+                (short) 1,
+                1D);
+
+        // int to other numeric
+        compareCastResult(CastExecutors.resolve(new IntType(false), new BigIntType(false)), 1, 1L);
+        compareCastResult(CastExecutors.resolve(new IntType(false), new FloatType(false)), 1, 1F);
+        compareCastResult(CastExecutors.resolve(new IntType(false), new DoubleType(false)), 1, 1D);
+
+        // bigint to other numeric
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new FloatType(false)), 1L, 1F);
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new DoubleType(false)), 1L, 1D);
+
+        // float to double
+        compareCastResult(
+                CastExecutors.resolve(new FloatType(false), new DoubleType(false)), 1F, 1D);
+    }
+
+    @Test
+    public void testNumericToTimestamp() {
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new TimestampType(3)),
+                1721898748,
+                DateTimeUtils.parseTimestampData("2024-07-25 09:12:28.000", 3));
+
+        Timestamp timestamp = Timestamp.fromEpochMillis(1721898748000L);
+        String tsString = DateTimeUtils.formatTimestamp(timestamp, TimeZone.getDefault(), 3);
+        Timestamp timestamp1 = DateTimeUtils.parseTimestampData(tsString, 3);
+
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new LocalZonedTimestampType(3)),
+                1721898748L,
+                timestamp1);
+    }
+
+    @Test
+    public void testNumericToDecimal() {
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new DecimalType(10, 2)),
+                (byte) 1,
+                DecimalUtils.castFrom(1, 10, 2));
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new DecimalType(10, 2)),
+                (short) 1,
+                DecimalUtils.castFrom(1, 10, 2));
+        compareCastResult(
+                CastExecutors.resolve(new IntType(false), new DecimalType(10, 2)),
+                1,
+                DecimalUtils.castFrom(1, 10, 2));
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new DecimalType(10, 2)),
+                1L,
+                DecimalUtils.castFrom(1, 10, 2));
+        compareCastResult(
+                CastExecutors.resolve(new FloatType(false), new DecimalType(10, 2)),
+                1.23456F,
+                DecimalUtils.castFrom(1.23456D, 10, 2));
+        compareCastResult(
+                CastExecutors.resolve(new DoubleType(false), new DecimalType(10, 2)),
+                1.23456D,
+                DecimalUtils.castFrom(1.23456D, 10, 2));
+    }
+
+    @Test
+    public void testDecimalToDecimal() {
+        compareCastResult(
+                CastExecutors.resolve(new DecimalType(10, 4), new DecimalType(10, 2)),
+                DecimalUtils.castFrom(1.23456D, 10, 4),
+                DecimalUtils.castFrom(1.23456D, 10, 2));
+        compareCastResult(
+                CastExecutors.resolve(new DecimalType(10, 2), new DecimalType(10, 4)),
+                DecimalUtils.castFrom(1.23456D, 10, 2),
+                DecimalUtils.castFrom(1.2300D, 10, 4));
+    }
+
+    @Test
+    public void testDecimalToNumeric() {
+        compareCastResult(
+                CastExecutors.resolve(new DecimalType(10, 4), new FloatType(false)),
+                DecimalUtils.castFrom(1.23456D, 10, 4),
+                1.2346F);
+        compareCastResult(
+                CastExecutors.resolve(new DecimalType(10, 2), new DoubleType(false)),
+                DecimalUtils.castFrom(1.23456D, 10, 2),
+                1.23D);
+    }
+
+    @Test
+    public void testBooleanToNumeric() {
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new TinyIntType(false)),
+                true,
+                (byte) 1);
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new SmallIntType(false)),
+                true,
+                (short) 1);
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new IntType(false)), true, 1);
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new BigIntType(false)), true, 1L);
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new FloatType(false)), true, 1F);
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new DoubleType(false)), true, 1D);
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new DecimalType(1, 0)),
+                true,
+                DecimalUtils.castFrom(1, 1, 0));
+    }
+
+    @Test
+    public void testNumericToBoolean() {
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new BooleanType(false)),
+                (byte) 1,
+                true);
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new BooleanType(false)),
+                (short) 1,
+                true);
+        compareCastResult(
+                CastExecutors.resolve(new IntType(false), new BooleanType(false)), 0, false);
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new BooleanType(false)), 12L, true);
+    }
+
+    // To string rules
+
+    @Test
+    public void testNumericToString() {
+        // byte to string
+        compareCastResult(
+                CastExecutors.resolve(new TinyIntType(false), new VarCharType(5)),
+                (byte) 1,
+                BinaryString.fromString("1"));
+
+        // short to string
+        compareCastResult(
+                CastExecutors.resolve(new SmallIntType(false), new VarCharType(5)),
+                (short) 1,
+                BinaryString.fromString("1"));
+
+        // int to string
+        compareCastResult(
+                CastExecutors.resolve(new IntType(false), new VarCharType(5)),
+                1,
+                BinaryString.fromString("1"));
+
+        // bigint to string
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new VarCharType(5)),
+                1L,
+                BinaryString.fromString("1"));
+
+        // float to string
+        compareCastResult(
+                CastExecutors.resolve(new FloatType(false), new VarCharType(10)),
+                1.23456F,
+                BinaryString.fromString("1.23456"));
+
+        // double to string
+        compareCastResult(
+                CastExecutors.resolve(new DoubleType(false), new VarCharType(10)),
+                1.23456D,
+                BinaryString.fromString("1.23456"));
+
+        // decimal to string
+        compareCastResult(
+                CastExecutors.resolve(new DecimalType(10, 5), new VarCharType(20)),
+                DecimalUtils.castFrom(1.23456D, 10, 5),
+                BinaryString.fromString("1.23456"));
+    }
+
+    @Test
+    public void testBooleanToString() {
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new CharType(5)),
+                true,
+                BinaryString.fromString("true "));
+        compareCastResult(
+                CastExecutors.resolve(new BooleanType(false), new VarCharType(5)),
+                true,
+                BinaryString.fromString("true"));
+    }
+
+    @Test
+    public void testTimestampToString() {
+        long mills = System.currentTimeMillis();
+        Timestamp timestamp = Timestamp.fromEpochMillis(mills);
+        compareCastResult(
+                CastExecutors.resolve(new TimestampType(5), VarCharType.STRING_TYPE),
+                timestamp,
+                BinaryString.fromString(
+                        DateTimeUtils.formatTimestamp(timestamp, DateTimeUtils.UTC_ZONE, 5)));
+
+        compareCastResult(
+                CastExecutors.resolve(new LocalZonedTimestampType(5), VarCharType.STRING_TYPE),
+                timestamp,
+                BinaryString.fromString(
+                        DateTimeUtils.formatTimestamp(timestamp, TimeZone.getDefault(), 5)));
+    }
+
+    @Test
+    public void testTimestampToNumeric() {
+        long mills = System.currentTimeMillis() / 1000 * 1000;
+        Timestamp timestamp1 = Timestamp.fromEpochMillis(mills);
+        long millisecond = timestamp1.getMillisecond();
+        Timestamp timestamp2 =
+                Timestamp.fromLocalDateTime(
+                        DateTimeUtils.toLocalDateTime(mills, TimeZone.getDefault().toZoneId()));
+        long millisecond1 = timestamp2.getMillisecond();
+
+        // cast from TimestampType to BigIntType or IntType
+        compareCastResult(
+                CastExecutors.resolve(new TimestampType(3), new BigIntType(false)),
+                timestamp1,
+                DateTimeUtils.unixTimestamp(millisecond));
+
+        compareCastResult(
+                CastExecutors.resolve(new LocalZonedTimestampType(3), new BigIntType(false)),
+                timestamp2,
+                DateTimeUtils.unixTimestamp(millisecond1));
+
+        compareCastResult(
+                CastExecutors.resolve(new TimestampType(3), new IntType(false)),
+                timestamp1,
+                (int) DateTimeUtils.unixTimestamp(millisecond));
+
+        compareCastResult(
+                CastExecutors.resolve(new LocalZonedTimestampType(3), new IntType(false)),
+                timestamp2,
+                (int) DateTimeUtils.unixTimestamp(millisecond1));
+
+        // cast from BigIntType or IntType to TimestampType
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new TimestampType(3)),
+                DateTimeUtils.unixTimestamp(millisecond),
+                timestamp1);
+
+        compareCastResult(
+                CastExecutors.resolve(new BigIntType(false), new LocalZonedTimestampType(3)),
+                DateTimeUtils.unixTimestamp(millisecond),
+                timestamp2);
+
+        compareCastResult(
+                CastExecutors.resolve(new IntType(false), new TimestampType(3)),
+                (int) DateTimeUtils.unixTimestamp(millisecond),
+                timestamp1);
+
+        compareCastResult(
+                CastExecutors.resolve(new IntType(false), new LocalZonedTimestampType(3)),
+                (int) DateTimeUtils.unixTimestamp(millisecond),
+                timestamp2);
+    }
+
+    @Test
+    public void testTimeToString() {
+        compareCastResult(
+                CastExecutors.resolve(new TimeType(2), VarCharType.STRING_TYPE),
+                36115615,
+                BinaryString.fromString("10:01:55.61"));
+    }
+
+    @Test
+    public void testDateToString() {
+        compareCastResult(
+                CastExecutors.resolve(new DateType(), VarCharType.STRING_TYPE),
+                19516,
+                BinaryString.fromString("2023-06-08"));
+    }
+
+    @Test
+    public void testStringToString() {
+        // varchar(10) to varchar(5)
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new VarCharType(5)),
+                BinaryString.fromString("1234567890"),
+                BinaryString.fromString("12345"));
+
+        // varchar(10) to varchar(20)
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new VarCharType(20)),
+                BinaryString.fromString("1234567890"),
+                BinaryString.fromString("1234567890"));
+
+        // varchar(10) to char(5)
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new CharType(5)),
+                BinaryString.fromString("1234567890"),
+                BinaryString.fromString("12345"));
+
+        // varchar(10) to char(20)
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new CharType(20)),
+                BinaryString.fromString("1234567890"),
+                BinaryString.fromString("1234567890          "));
+
+        // char(10) to varchar(5)
+        compareCastResult(
+                CastExecutors.resolve(new CharType(10), new VarCharType(5)),
+                BinaryString.fromString("1234567890"),
+                BinaryString.fromString("12345"));
+
+        // char(10) to varchar(20)
+        compareCastResult(
+                CastExecutors.resolve(new CharType(10), new VarCharType(20)),
+                BinaryString.fromString("12345678  "),
+                BinaryString.fromString("12345678  "));
+
+        // char(10) to char(5)
+        compareCastResult(
+                CastExecutors.resolve(new CharType(10), new CharType(5)),
+                BinaryString.fromString("12345678  "),
+                BinaryString.fromString("12345"));
+
+        // char(10) to char(20)
+        compareCastResult(
+                CastExecutors.resolve(new CharType(10), new CharType(20)),
+                BinaryString.fromString("12345678  "),
+                BinaryString.fromString("12345678            "));
+    }
+
+    // From string rules
+
+    @Test
+    public void testStringToBoolean() {
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("t"),
+                true);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("true"),
+                true);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("y"),
+                true);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("yes"),
+                true);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("1"),
+                true);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("TRUE"),
+                true);
+
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("f"),
+                false);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("false"),
+                false);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("n"),
+                false);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("no"),
+                false);
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BooleanType(false)),
+                BinaryString.fromString("0"),
+                false);
+
+        assertThatThrownBy(
+                        () ->
+                                compareCastResult(
+                                        CastExecutors.resolve(
+                                                new VarCharType(5), new BooleanType(false)),
+                                        BinaryString.fromString("11"),
+                                        false))
+                .hasMessage("Cannot parse '11' as BOOLEAN.");
+    }
+
+    @Test
+    public void testStringToDecimal() {
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new DecimalType(5, 2)),
+                BinaryString.fromString("1.233"),
+                DecimalUtils.castFrom(1.233D, 5, 2));
+    }
+
+    @Test
+    public void testStringToNumeric() {
+        // string to byte
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new TinyIntType(false)),
+                BinaryString.fromString("1"),
+                (byte) 1);
+
+        // string to short
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new SmallIntType(false)),
+                BinaryString.fromString("1"),
+                (short) 1);
+
+        // string to int
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new IntType(false)),
+                BinaryString.fromString("1"),
+                1);
+
+        // string to bigint
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(5), new BigIntType(false)),
+                BinaryString.fromString("1"),
+                1L);
+
+        // string to float
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new FloatType(false)),
+                BinaryString.fromString("1.23456"),
+                1.23456F);
+
+        // string to double
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new DoubleType(false)),
+                BinaryString.fromString("1.23456"),
+                1.23456D);
+    }
+
+    @Test
+    public void testStringToDate() {
+        String date = "2023-06-06";
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(25), new DateType()),
+                BinaryString.fromString(date),
+                DateTimeUtils.parseDate(date));
+    }
+
+    @Test
+    public void testStringToTime() {
+        String date = "09:30:00.0";
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(25), new TimeType(2)),
+                BinaryString.fromString(date),
+                DateTimeUtils.parseTime(date));
+    }
+
+    @Test
+    public void testStringToTimestamp() {
+        String date = "2017-12-12 09:30:00.0";
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(25), new TimestampType(3)),
+                BinaryString.fromString(date),
+                DateTimeUtils.parseTimestampData(date, 3));
+
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(25), new LocalZonedTimestampType(3)),
+                BinaryString.fromString(date),
+                DateTimeUtils.parseTimestampData(date, 3, TimeZone.getDefault()));
+    }
+
+    @Test
+    public void testStringToBinary() {
+        // string(10) to binary(5)
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new VarBinaryType(5)),
+                BinaryString.fromString("12345678"),
+                "12345".getBytes());
+
+        // string(10) to binary(20)
+        compareCastResult(
+                CastExecutors.resolve(new VarCharType(10), new VarBinaryType(20)),
+                BinaryString.fromString("12345678"),
+                "12345678".getBytes());
+    }
+
+    @Test
+    public void testStringToArray() {
+        CastExecutor<BinaryString, InternalArray> stringToIntArray =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(
+                                VarCharType.STRING_TYPE, DataTypes.ARRAY(DataTypes.INT()));
+
+        InternalArray result = stringToIntArray.cast(BinaryString.fromString("[1, 2, 3]"));
+        assertThat(result.size()).isEqualTo(3);
+        assertThat(result.getInt(0)).isEqualTo(1);
+        assertThat(result.getInt(1)).isEqualTo(2);
+        assertThat(result.getInt(2)).isEqualTo(3);
+
+        // Test empty array
+        result = stringToIntArray.cast(BinaryString.fromString("[]"));
+        assertThat(result.size()).isEqualTo(0);
+
+        // Test string to string array
+        CastExecutor<BinaryString, InternalArray> stringToStringArray =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(
+                                VarCharType.STRING_TYPE, DataTypes.ARRAY(DataTypes.STRING()));
+
+        result = stringToStringArray.cast(BinaryString.fromString("[hello, world, test]"));
+        assertThat(result.size()).isEqualTo(3);
+        assertThat(result.getString(0).toString()).isEqualTo("hello");
+        assertThat(result.getString(1).toString()).isEqualTo("world");
+        assertThat(result.getString(2).toString()).isEqualTo("test");
+
+        // Test array with null values
+        result = stringToIntArray.cast(BinaryString.fromString("[1, null, 3]"));
+        assertThat(result.size()).isEqualTo(3);
+        assertThat(result.getInt(0)).isEqualTo(1);
+        assertThat(result.isNullAt(1)).isTrue();
+        assertThat(result.getInt(2)).isEqualTo(3);
+    }
+
+    @Test
+    public void testStringToMap() {
+        // Test string to map<string, int>
+        CastExecutor<BinaryString, InternalMap> stringToMap =
+                (CastExecutor<BinaryString, InternalMap>)
+                        CastExecutors.resolve(
+                                VarCharType.STRING_TYPE,
+                                DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()));
+
+        InternalMap result = stringToMap.cast(BinaryString.fromString("{key1 -> 1, key2 -> 2}"));
+        assertThat(result.size()).isEqualTo(2);
+
+        InternalArray keyArray = result.keyArray();
+        InternalArray valueArray = result.valueArray();
+        assertThat(keyArray.getString(0).toString()).isEqualTo("key2");
+        assertThat(valueArray.getInt(0)).isEqualTo(2);
+        assertThat(keyArray.getString(1).toString()).isEqualTo("key1");
+        assertThat(valueArray.getInt(1)).isEqualTo(1);
+
+        // Test empty map
+        result = stringToMap.cast(BinaryString.fromString("{}"));
+        assertThat(result.size()).isEqualTo(0);
+
+        // Test map with null values
+        result = stringToMap.cast(BinaryString.fromString("{key1 -> null, key2 -> 42}"));
+        assertThat(result.size()).isEqualTo(2);
+        keyArray = result.keyArray();
+        valueArray = result.valueArray();
+        assertThat(keyArray.getString(0).toString()).isEqualTo("key2");
+        assertThat(valueArray.getInt(0)).isEqualTo(42);
+        assertThat(keyArray.getString(1).toString()).isEqualTo("key1");
+        assertThat(valueArray.isNullAt(1)).isTrue();
+
+        result = stringToMap.cast(BinaryString.fromString("MAP(key1, null, key2, 42)"));
+        assertThat(result.size()).isEqualTo(2);
+        keyArray = result.keyArray();
+        valueArray = result.valueArray();
+        assertThat(keyArray.getString(0).toString()).isEqualTo("key2");
+        assertThat(valueArray.getInt(0)).isEqualTo(42);
+        assertThat(keyArray.getString(1).toString()).isEqualTo("key1");
+        assertThat(valueArray.isNullAt(1)).isTrue();
+    }
+
+    @Test
+    public void testStringToRow() {
+        // Test string to row
+        RowType rowType = RowType.of(DataTypes.INT(), DataTypes.STRING(), DataTypes.BOOLEAN());
+        CastExecutor<BinaryString, InternalRow> stringToRow =
+                (CastExecutor<BinaryString, InternalRow>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, rowType);
+
+        InternalRow result = stringToRow.cast(BinaryString.fromString("{42, hello, true}"));
+        assertThat(result.getFieldCount()).isEqualTo(3);
+        assertThat(result.getInt(0)).isEqualTo(42);
+        assertThat(result.getString(1).toString()).isEqualTo("hello");
+        assertThat(result.getBoolean(2)).isTrue();
+
+        // Test empty row
+        result = stringToRow.cast(BinaryString.fromString("{}"));
+        assertThat(result.getFieldCount()).isEqualTo(3);
+        assertThat(result.isNullAt(0)).isTrue();
+        assertThat(result.isNullAt(1)).isTrue();
+        assertThat(result.isNullAt(2)).isTrue();
+
+        // Test row with null values
+        result = stringToRow.cast(BinaryString.fromString("{null, test, false}"));
+        assertThat(result.getFieldCount()).isEqualTo(3);
+        assertThat(result.isNullAt(0)).isTrue();
+        assertThat(result.getString(1).toString()).isEqualTo("test");
+        assertThat(result.getBoolean(2)).isFalse();
+    }
+
+    @Test
+    public void testStringToComplexTypesErrorHandling() {
+        // Test invalid array format
+        CastExecutor<BinaryString, InternalArray> stringToIntArray =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(
+                                VarCharType.STRING_TYPE, DataTypes.ARRAY(DataTypes.INT()));
+
+        try {
+            stringToIntArray.cast(BinaryString.fromString("[1, 2, 3")); // missing closing bracket
+            fail("Expected RuntimeException for invalid array format");
+        } catch (RuntimeException e) {
+            assertThat(e.getMessage()).contains("Cannot parse");
+            assertThat(e.getMessage()).contains("as ARRAY");
+        }
+
+        // Test invalid map format
+        CastExecutor<BinaryString, InternalMap> stringToMap =
+                (CastExecutor<BinaryString, InternalMap>)
+                        CastExecutors.resolve(
+                                VarCharType.STRING_TYPE,
+                                DataTypes.MAP(DataTypes.STRING(), DataTypes.INT()));
+
+        try {
+            stringToMap.cast(BinaryString.fromString("{key1 -> 1, key2")); // incomplete entry
+            fail("Expected RuntimeException for invalid map format");
+        } catch (RuntimeException e) {
+            assertThat(e.getMessage()).contains("Cannot parse");
+            assertThat(e.getMessage()).contains("as MAP");
+        }
+
+        // Test invalid row format
+        RowType rowType = RowType.of(DataTypes.INT(), DataTypes.STRING());
+        CastExecutor<BinaryString, InternalRow> stringToRow =
+                (CastExecutor<BinaryString, InternalRow>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, rowType);
+
+        try {
+            stringToRow.cast(BinaryString.fromString("{42, hello, extra}")); // too many fields
+            fail("Expected RuntimeException for field count mismatch");
+        } catch (RuntimeException e) {
+            assertThat(e.getMessage()).contains("field count mismatch");
+        }
+    }
+
+    @Test
+    public void testBinaryToString() {
+        // binary(5) to string(10)
+        compareCastResult(
+                CastExecutors.resolve(new VarBinaryType(5), new VarCharType(10)),
+                "12345".getBytes(),
+                BinaryString.fromString("12345"));
+
+        // binary(20) to string(10)
+        compareCastResult(
+                CastExecutors.resolve(new VarBinaryType(20), new VarCharType(10)),
+                "12345678".getBytes(),
+                BinaryString.fromString("12345678"));
+    }
+
+    // To binary rules
+
+    @Test
+    public void testBinaryToBinary() {
+        // binary(10) to binary(5)
+        compareCastResult(
+                CastExecutors.resolve(new BinaryType(10), new BinaryType(5)),
+                "1234567890".getBytes(),
+                "12345".getBytes());
+
+        // binary(10) to binary(20)
+        compareCastResult(
+                CastExecutors.resolve(new BinaryType(10), new BinaryType(20)),
+                "12345678".getBytes(),
+                new byte[] {49, 50, 51, 52, 53, 54, 55, 56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+
+        // binary(10) to varbinary(5)
+        compareCastResult(
+                CastExecutors.resolve(new BinaryType(10), new VarBinaryType(5)),
+                "1234567890".getBytes(),
+                "12345".getBytes());
+
+        // binary(10) to varbinary(20)
+        compareCastResult(
+                CastExecutors.resolve(new BinaryType(10), new VarBinaryType(20)),
+                "12345678".getBytes(),
+                "12345678".getBytes());
+    }
+
+    // Date/Time/Timestamp rules
+
+    @Test
+    public void testTimestampData() {
+        long mills = System.currentTimeMillis();
+        Timestamp timestamp = Timestamp.fromEpochMillis(mills);
+
+        // timestamp(5) to timestamp(2)
+        compareCastResult(
+                CastExecutors.resolve(new TimestampType(5), new TimestampType(2)),
+                timestamp,
+                DateTimeUtils.truncate(Timestamp.fromEpochMillis(mills), 2));
+
+        // timestamp to date
+        compareCastResult(
+                CastExecutors.resolve(new TimestampType(5), new DateType()),
+                Timestamp.fromEpochMillis(mills),
+                (int) (mills / DateTimeUtils.MILLIS_PER_DAY));
+
+        // timestamp to time
+        compareCastResult(
+                CastExecutors.resolve(new TimestampType(5), new TimeType(2)),
+                Timestamp.fromEpochMillis(mills),
+                (int) (mills % DateTimeUtils.MILLIS_PER_DAY));
+
+        // timestamp(3) to timestamp_ltz(3)
+        compareCastResult(
+                CastExecutors.resolve(new TimestampType(3), new LocalZonedTimestampType(3)),
+                timestamp,
+                DateTimeUtils.timestampToTimestampWithLocalZone(
+                        Timestamp.fromEpochMillis(mills), TimeZone.getDefault()));
+
+        // timestamp_ltz(5) to timestamp(2)
+        compareCastResult(
+                CastExecutors.resolve(new LocalZonedTimestampType(5), new TimestampType(2)),
+                timestamp,
+                DateTimeUtils.truncate(
+                        DateTimeUtils.timestampWithLocalZoneToTimestamp(
+                                Timestamp.fromEpochMillis(mills), TimeZone.getDefault()),
+                        2));
+
+        // timestamp_ltz to date
+        compareCastResult(
+                CastExecutors.resolve(new LocalZonedTimestampType(5), new DateType()),
+                Timestamp.fromEpochMillis(mills),
+                DateTimeUtils.timestampWithLocalZoneToDate(timestamp, TimeZone.getDefault()));
+
+        // timestamp_ltz to time
+        compareCastResult(
+                CastExecutors.resolve(new LocalZonedTimestampType(5), new TimeType(2)),
+                Timestamp.fromEpochMillis(mills),
+                DateTimeUtils.timestampWithLocalZoneToTime(timestamp, TimeZone.getDefault()));
+    }
+
+    @Test
+    public void testTimestampToDatePreEpoch() {
+        CastExecutor<?, ?> cast = CastExecutors.resolve(new TimestampType(6), new DateType());
+        LocalDateTime[] timestamps = {
+            LocalDateTime.of(1969, 12, 31, 23, 59, 59),
+            LocalDateTime.of(1960, 6, 15, 10, 30),
+            LocalDateTime.of(1969, 12, 31, 0, 0),
+            LocalDateTime.of(2024, 3, 4, 5, 6, 7)
+        };
+
+        for (LocalDateTime timestamp : timestamps) {
+            compareCastResult(
+                    cast,
+                    Timestamp.fromLocalDateTime(timestamp),
+                    (int) timestamp.toLocalDate().toEpochDay());
+        }
+    }
+
+    @Test
+    public void testTimestampToTimePreEpoch() {
+        CastExecutor<?, ?> cast = CastExecutors.resolve(new TimestampType(3), new TimeType(3));
+
+        // pre-epoch 1969-12-31 23:00:00 -> time-of-day 23:00:00 == 82_800_000 ms
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1969, 12, 31, 23, 0, 0)),
+                82800000);
+
+        // pre-epoch 1969-12-31 12:34:56.789 -> 12*3600000 + 34*60000 + 56*1000 + 789
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1969, 12, 31, 12, 34, 56, 789000000)),
+                45296789);
+
+        // post-epoch 1970-01-01 10:00:00 -> 36_000_000 ms (unchanged behavior)
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1970, 1, 1, 10, 0, 0)),
+                36000000);
+    }
+
+    @Test
+    public void testTimestampToNumericPreEpoch() {
+        CastExecutor<?, ?> cast =
+                CastExecutors.resolve(new TimestampType(3), new BigIntType(false));
+
+        // pre-epoch 1969-12-31 23:59:58.500 is -1500 millis, whose epoch second is -2
+        compareCastResult(cast, Timestamp.fromEpochMillis(-1500), -2L);
+        compareCastResult(cast, Timestamp.fromEpochMillis(-1000), -1L);
+
+        // post-epoch 1970-01-01 00:00:01.500 -> 1 (unchanged behavior)
+        compareCastResult(cast, Timestamp.fromEpochMillis(1500), 1L);
+    }
+
+    @Test
+    public void testTimestampToTimestampPreEpoch() {
+        CastExecutor<?, ?> cast = CastExecutors.resolve(new TimestampType(6), new TimestampType(0));
+
+        // narrowing 1969-12-31 23:59:59.999999 must drop the fraction, not cross the epoch
+        compareCastResult(
+                cast,
+                Timestamp.fromLocalDateTime(
+                        LocalDateTime.of(1969, 12, 31, 23, 59, 59, 999_999_000)),
+                Timestamp.fromLocalDateTime(LocalDateTime.of(1969, 12, 31, 23, 59, 59)));
+    }
+
+    @Test
+    public void testDateToTimestamp() {
+        String date = "2023-06-06";
+        compareCastResult(
+                CastExecutors.resolve(new DateType(), new TimestampType(5)),
+                DateTimeUtils.parseDate(date),
+                DateTimeUtils.parseTimestampData(date, 3));
+
+        compareCastResult(
+                CastExecutors.resolve(new DateType(), new LocalZonedTimestampType(5)),
+                DateTimeUtils.parseDate(date),
+                DateTimeUtils.parseTimestampData(date, 3, TimeZone.getDefault()));
+    }
+
+    @Test
+    public void testTimeToTimestamp() {
+        String time = "12:00:00.123";
+        compareCastResult(
+                CastExecutors.resolve(new TimeType(), new TimestampType(3)),
+                DateTimeUtils.parseTime(time),
+                DateTimeUtils.parseTimestampData("1970-01-01 " + time, 3));
+    }
+
+    @Test
+    public void testArrayToString() {
+        ArrayType arrayType = new ArrayType(DataTypes.INT());
+        GenericArray genericArray = new GenericArray(new Integer[] {1, null, 2});
+        compareCastResult(
+                CastExecutors.resolve(arrayType, DataTypes.STRING()),
+                genericArray,
+                BinaryString.fromString("[1, null, 2]"));
+    }
+
+    @Test
+    public void testMapToString() {
+        MapType mapType = new MapType(DataTypes.INT(), DataTypes.STRING());
+        Map<Object, Object> javaMap = new HashMap<>();
+        javaMap.put(1, BinaryString.fromString("i"));
+        javaMap.put(2, BinaryString.fromString("miss"));
+        javaMap.put(3, BinaryString.fromString("you"));
+        javaMap.put(4, null);
+        GenericMap genericMap = new GenericMap(javaMap);
+        compareCastResult(
+                CastExecutors.resolve(mapType, DataTypes.STRING()),
+                genericMap,
+                BinaryString.fromString("{1 -> i, 2 -> miss, 3 -> you, 4 -> null}"));
+    }
+
+    @Test
+    public void testRowToString() {
+        RowType rowType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(0, "f0", DataTypes.INT()),
+                        DataTypes.FIELD(
+                                1,
+                                "f1",
+                                DataTypes.ROW(
+                                        DataTypes.FIELD(2, "f0", DataTypes.DATE()),
+                                        DataTypes.FIELD(
+                                                3,
+                                                "f1",
+                                                new MapType(
+                                                        DataTypes.INT(),
+                                                        new ArrayType(DataTypes.INT()))),
+                                        DataTypes.FIELD(4, "f2", DataTypes.INT()))));
+
+        HashMap<Integer, GenericArray> javaMap = new HashMap<>();
+        javaMap.put(1, new GenericArray(new Integer[] {1, null, 2}));
+        GenericRow row =
+                GenericRow.of(
+                        1,
+                        GenericRow.of(
+                                DateTimeUtils.parseDate("2025-01-06"),
+                                new GenericMap(javaMap),
+                                null));
+
+        compareCastResult(
+                CastExecutors.resolve(rowType, DataTypes.STRING()),
+                row,
+                BinaryString.fromString("{1, {2025-01-06, {1 -> [1, null, 2]}, null}}"));
+    }
+
+    @Test
+    public void testStringToArrayQuotingAndEscaping() {
+        ArrayType arrayType = new ArrayType(DataTypes.STRING());
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, arrayType);
+
+        // quotes group a token across the separator and do not survive into the value
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[\"a,b\", c]"),
+                new GenericArray(
+                        new Object[] {
+                            BinaryString.fromString("a,b"), BinaryString.fromString("c")
+                        }));
+
+        // quoting is how an empty string is written, so the element must be kept
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[\"\", a]"),
+                new GenericArray(
+                        new Object[] {BinaryString.fromString(""), BinaryString.fromString("a")}));
+
+        // an unquoted null is the null element; a quoted one is the four-character string
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[null, \"null\"]"),
+                new GenericArray(new Object[] {null, BinaryString.fromString("null")}));
+
+        // a backslash escapes the next character and is itself syntax
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[a\\,b, c]"),
+                new GenericArray(
+                        new Object[] {
+                            BinaryString.fromString("a,b"), BinaryString.fromString("c")
+                        }));
+    }
+
+    @Test
+    public void testStringToRowQuotingAndEscaping() {
+        RowType rowType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(0, "f0", DataTypes.STRING()),
+                        DataTypes.FIELD(1, "f1", DataTypes.INT()));
+        CastExecutor<BinaryString, InternalRow> cast =
+                (CastExecutor<BinaryString, InternalRow>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, rowType);
+
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{\"a,b\", 2}"),
+                GenericRow.of(BinaryString.fromString("a,b"), 2));
+
+        // an empty quoted field stays a field, so the field count still matches
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{\"\", 2}"),
+                GenericRow.of(BinaryString.fromString(""), 2));
+
+        // a quoted null is the string, an unquoted one is SQL NULL
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{\"null\", 2}"),
+                GenericRow.of(BinaryString.fromString("null"), 2));
+        compareCastResult(cast, BinaryString.fromString("{null, 2}"), GenericRow.of(null, 2));
+
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{a\\,b, 2}"),
+                GenericRow.of(BinaryString.fromString("a,b"), 2));
+    }
+
+    @Test
+    public void testStringToNestedArrayKeepsInnerSyntax() {
+        // quotes and escapes belong to whichever level wrote them: the outer split must leave a
+        // nested literal's own syntax in place for the element rule to parse again, or the inner
+        // separator stops being protected and the element count changes
+        ArrayType nested = new ArrayType(new ArrayType(DataTypes.STRING()));
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, nested);
+
+        assertNestedElements(cast, "[[\"a,b\"], [c]]", new String[] {"a,b"}, new String[] {"c"});
+        assertNestedElements(cast, "[[a\\,b], [c]]", new String[] {"a,b"}, new String[] {"c"});
+        assertNestedElements(cast, "[[\"null\"], [a]]", new String[] {"null"}, new String[] {"a"});
+        assertNestedElements(cast, "[[\"\"], [a]]", new String[] {""}, new String[] {"a"});
+        assertNestedElements(cast, "[[\" a \"], [b]]", new String[] {" a "}, new String[] {"b"});
+        assertNestedElements(cast, "[[1, 2], [3]]", new String[] {"1", "2"}, new String[] {"3"});
+    }
+
+    private static void assertNestedElements(
+            CastExecutor<BinaryString, InternalArray> cast, String literal, String[]... expected) {
+        InternalArray outer = cast.cast(BinaryString.fromString(literal));
+        assertThat(outer.size()).as("outer size of %s", literal).isEqualTo(expected.length);
+        for (int i = 0; i < expected.length; i++) {
+            InternalArray inner = outer.getArray(i);
+            assertThat(inner.size())
+                    .as("inner size of %s at %s", literal, i)
+                    .isEqualTo(expected[i].length);
+            for (int j = 0; j < expected[i].length; j++) {
+                assertThat(inner.getString(j).toString())
+                        .as("element %s.%s of %s", i, j, literal)
+                        .isEqualTo(expected[i][j]);
+            }
+        }
+    }
+
+    @Test
+    public void testStringToArrayEscapedNullIsALiteral() {
+        ArrayType arrayType = new ArrayType(DataTypes.STRING());
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, arrayType);
+
+        // escaping, like quoting, says the token is written text rather than the null literal
+        compareCastResult(
+                cast,
+                BinaryString.fromString("[\\null, x]"),
+                new GenericArray(
+                        new Object[] {
+                            BinaryString.fromString("null"), BinaryString.fromString("x")
+                        }));
+    }
+
+    @Test
+    public void testStringToRowWhitespaceOnlyFieldIsNotAField() {
+        RowType rowType =
+                DataTypes.ROW(
+                        DataTypes.FIELD(0, "f0", DataTypes.STRING()),
+                        DataTypes.FIELD(1, "f1", DataTypes.STRING()),
+                        DataTypes.FIELD(2, "f2", DataTypes.STRING()));
+        CastExecutor<BinaryString, InternalRow> cast =
+                (CastExecutor<BinaryString, InternalRow>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, rowType);
+
+        // whitespace is not part of a token, so a field made only of whitespace was never
+        // written, and where it sits does not change that
+        for (String literal : new String[] {"{a,  ,b}", "{ ,a,b}", "{a,b, }"}) {
+            assertThatThrownBy(() -> cast.cast(BinaryString.fromString(literal)))
+                    .as("%s", literal)
+                    .hasMessageContaining("Row field count mismatch. Expected: 3, Actual: 2");
+        }
+
+        // quoting is how an empty field is written
+        compareCastResult(
+                cast,
+                BinaryString.fromString("{a, \"\", b}"),
+                GenericRow.of(
+                        BinaryString.fromString("a"),
+                        BinaryString.fromString(""),
+                        BinaryString.fromString("b")));
+    }
+
+    @Test
+    public void testStringToArraySkipsAnEmptyElement() {
+        ArrayType arrayType = new ArrayType(DataTypes.INT());
+        CastExecutor<BinaryString, InternalArray> cast =
+                (CastExecutor<BinaryString, InternalArray>)
+                        CastExecutors.resolve(VarCharType.STRING_TYPE, arrayType);
+
+        // an element written as nothing, with or without whitespace, is no element: handing the
+        // empty string to the int cast instead would fail the whole array
+        compareCastResult(
+                cast, BinaryString.fromString("[1,,3]"), new GenericArray(new Integer[] {1, 3}));
+        compareCastResult(
+                cast, BinaryString.fromString("[1, , 3]"), new GenericArray(new Integer[] {1, 3}));
+    }
+
+    @Test
+    public void testStringToMapQuotingAndEscaping() {
+        CastExecutor<?, ?> cast =
+                CastExecutors.resolve(
+                        VarCharType.STRING_TYPE,
+                        new MapType(DataTypes.STRING(), DataTypes.STRING()));
+
+        // quoting is how an empty key or value is written
+        Map<Object, Object> emptyKey = new HashMap<>();
+        emptyKey.put(BinaryString.fromString(""), BinaryString.fromString("a"));
+        compareCastResult(cast, BinaryString.fromString("{\"\" -> a}"), new GenericMap(emptyKey));
+        Map<Object, Object> emptyValue = new HashMap<>();
+        emptyValue.put(BinaryString.fromString("k"), BinaryString.fromString(""));
+        compareCastResult(cast, BinaryString.fromString("{k -> \"\"}"), new GenericMap(emptyValue));
+
+        // an unquoted null is SQL NULL; a quoted one is the four-character string
+        Map<Object, Object> quotedNullValue = new HashMap<>();
+        quotedNullValue.put(BinaryString.fromString("k"), BinaryString.fromString("null"));
+        compareCastResult(
+                cast, BinaryString.fromString("{k -> \"null\"}"), new GenericMap(quotedNullValue));
+        Map<Object, Object> sqlNullValue = new HashMap<>();
+        sqlNullValue.put(BinaryString.fromString("k"), null);
+        compareCastResult(
+                cast, BinaryString.fromString("{k -> null}"), new GenericMap(sqlNullValue));
+        Map<Object, Object> quotedNullKey = new HashMap<>();
+        quotedNullKey.put(BinaryString.fromString("null"), BinaryString.fromString("a"));
+        compareCastResult(
+                cast, BinaryString.fromString("{\"null\" -> a}"), new GenericMap(quotedNullKey));
+        Map<Object, Object> sqlNullKey = new HashMap<>();
+        sqlNullKey.put(null, BinaryString.fromString("a"));
+        compareCastResult(cast, BinaryString.fromString("{null -> a}"), new GenericMap(sqlNullKey));
+
+        // escaping, like quoting, writes the four-character string rather than SQL NULL
+        Map<Object, Object> escapedNullValue = new HashMap<>();
+        escapedNullValue.put(BinaryString.fromString("k"), BinaryString.fromString("null"));
+        compareCastResult(
+                cast, BinaryString.fromString("{k -> \\null}"), new GenericMap(escapedNullValue));
+
+        // quotes group a token across the arrow and the entry separator
+        Map<Object, Object> quotedArrow = new HashMap<>();
+        quotedArrow.put(BinaryString.fromString("a->b"), BinaryString.fromString("c"));
+        compareCastResult(
+                cast, BinaryString.fromString("{\"a->b\" -> c}"), new GenericMap(quotedArrow));
+        Map<Object, Object> quotedComma = new HashMap<>();
+        quotedComma.put(BinaryString.fromString("a,b"), BinaryString.fromString("c"));
+        compareCastResult(
+                cast, BinaryString.fromString("{\"a,b\" -> c}"), new GenericMap(quotedComma));
+    }
+
+    @Test
+    public void testStringToMapFunctionQuoting() {
+        CastExecutor<?, ?> cast =
+                CastExecutors.resolve(
+                        VarCharType.STRING_TYPE,
+                        new MapType(DataTypes.STRING(), DataTypes.STRING()));
+
+        Map<Object, Object> emptyKey = new HashMap<>();
+        emptyKey.put(BinaryString.fromString(""), BinaryString.fromString("a"));
+        compareCastResult(cast, BinaryString.fromString("MAP(\"\", a)"), new GenericMap(emptyKey));
+
+        Map<Object, Object> emptyValue = new HashMap<>();
+        emptyValue.put(BinaryString.fromString("k"), BinaryString.fromString(""));
+        compareCastResult(
+                cast, BinaryString.fromString("MAP(k, \"\")"), new GenericMap(emptyValue));
+
+        Map<Object, Object> quotedNullValue = new HashMap<>();
+        quotedNullValue.put(BinaryString.fromString("k"), BinaryString.fromString("null"));
+        compareCastResult(
+                cast, BinaryString.fromString("MAP(k, \"null\")"), new GenericMap(quotedNullValue));
+        Map<Object, Object> quotedNullKey = new HashMap<>();
+        quotedNullKey.put(BinaryString.fromString("null"), BinaryString.fromString("a"));
+        compareCastResult(
+                cast, BinaryString.fromString("MAP(\"null\", a)"), new GenericMap(quotedNullKey));
+    }
+
+    @Test
+    public void testStringToMapPreservesEscapedCharacters() {
+        Map<Object, Object> expected = new HashMap<>();
+        expected.put(BinaryString.fromString("a,b"), BinaryString.fromString("v\\1"));
+        compareCastResult(
+                CastExecutors.resolve(
+                        VarCharType.STRING_TYPE,
+                        new MapType(DataTypes.STRING(), DataTypes.STRING())),
+                BinaryString.fromString("{a\\,b -> v\\\\1}"),
+                new GenericMap(expected));
+
+        Map<Object, Object> escapedQuote = new HashMap<>();
+        escapedQuote.put(BinaryString.fromString("q\"z, w"), BinaryString.fromString("v"));
+        compareCastResult(
+                CastExecutors.resolve(
+                        VarCharType.STRING_TYPE,
+                        new MapType(DataTypes.STRING(), DataTypes.STRING())),
+                BinaryString.fromString("{\"q\\\"z, w\" -> v}"),
+                new GenericMap(escapedQuote));
+    }
+
+    @SuppressWarnings("rawtypes")
+    private void compareCastResult(CastExecutor<?, ?> cast, Object input, Object output) {
+        assertThat(((CastExecutor) cast).cast(input)).isEqualTo(output);
+    }
+}

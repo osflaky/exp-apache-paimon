@@ -1,0 +1,2019 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.iceberg;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.catalog.FileSystemCatalog;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BinaryRowWriter;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.iceberg.manifest.IcebergManifestFileMeta;
+import org.apache.paimon.iceberg.manifest.IcebergManifestList;
+import org.apache.paimon.iceberg.metadata.IcebergMetadata;
+import org.apache.paimon.iceberg.metadata.IcebergSnapshot;
+import org.apache.paimon.options.MemorySize;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.schema.FileSystemSchemaManager;
+import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.sink.TableCommitImpl;
+import org.apache.paimon.table.sink.TableWriteImpl;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+
+import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableUtil;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.IcebergGenerics;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.hadoop.HadoopCatalog;
+import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.rest.Endpoint;
+import org.apache.iceberg.rest.RESTCatalog;
+import org.apache.iceberg.rest.RESTCatalogServer;
+import org.apache.iceberg.rest.RESTServerExtension;
+import org.apache.iceberg.types.Types;
+import org.apache.iceberg.types.Types.NestedField;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
+
+import javax.annotation.Nullable;
+
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.BiFunction;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.iceberg.IcebergCommitCallback.catalogTableMetadataPath;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Test for {@link IcebergRestMetadataCommitter}. */
+public class IcebergRestMetadataCommitterTest {
+
+    @RegisterExtension
+    private static final RESTServerExtension REST_SERVER_EXTENSION =
+            new RESTServerExtension(
+                    Map.of(
+                            RESTCatalogServer.REST_PORT,
+                            RESTServerExtension.FREE_PORT,
+                            CatalogProperties.CLIENT_POOL_SIZE,
+                            "1",
+                            CatalogProperties.CATALOG_IMPL,
+                            HadoopCatalog.class.getName()));
+
+    @TempDir public java.nio.file.Path tempDir;
+
+    protected static RESTCatalog restCatalog;
+
+    @BeforeEach
+    public void setUp() {
+        restCatalog = REST_SERVER_EXTENSION.client();
+    }
+
+    @Test
+    public void testUnPartitionedPrimaryKeyTable() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.INT(), DataTypes.STRING(), DataTypes.INT(), DataTypes.BIGINT()
+                        },
+                        new String[] {"k1", "k2", "v1", "v2"});
+
+        int numRounds = 20;
+        int numRecords = 1000;
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        List<List<TestRecord>> testRecords = new ArrayList<>();
+        List<List<String>> expected = new ArrayList<>();
+        Map<String, String> expectedMap = new LinkedHashMap<>();
+        for (int r = 0; r < numRounds; r++) {
+            List<TestRecord> round = new ArrayList<>();
+            for (int i = 0; i < numRecords; i++) {
+                int k1 = random.nextInt(0, 100);
+                String k2 = String.valueOf(random.nextInt(1000, 1010));
+                int v1 = random.nextInt();
+                long v2 = random.nextLong();
+                round.add(
+                        new TestRecord(
+                                BinaryRow.EMPTY_ROW,
+                                GenericRow.of(k1, BinaryString.fromString(k2), v1, v2)));
+                expectedMap.put(String.format("%d, %s", k1, k2), String.format("%d, %d", v1, v2));
+            }
+            testRecords.add(round);
+            expected.add(
+                    expectedMap.entrySet().stream()
+                            .map(e -> String.format("Record(%s, %s)", e.getKey(), e.getValue()))
+                            .collect(Collectors.toList()));
+        }
+
+        runCompatibilityTest(
+                rowType,
+                Collections.emptyList(),
+                Arrays.asList("k1", "k2"),
+                testRecords,
+                expected,
+                Record::toString);
+
+        PartitionSpec expectedPartitionSpec = PartitionSpec.builderFor(new Schema()).build();
+        runPartitionSpecCompatibilityTest(expectedPartitionSpec);
+    }
+
+    @Test
+    public void testPartitionedPrimaryKeyTable() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.INT(),
+                            DataTypes.STRING(),
+                            DataTypes.STRING(),
+                            DataTypes.INT(),
+                            DataTypes.BIGINT()
+                        },
+                        new String[] {"pt1", "pt2", "k", "v1", "v2"});
+
+        BiFunction<Integer, String, BinaryRow> binaryRow =
+                (pt1, pt2) -> {
+                    BinaryRow b = new BinaryRow(2);
+                    BinaryRowWriter writer = new BinaryRowWriter(b);
+                    writer.writeInt(0, pt1);
+                    writer.writeString(1, BinaryString.fromString(pt2));
+                    writer.complete();
+                    return b;
+                };
+
+        int numRounds = 20;
+        int numRecords = 500;
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        boolean samePartitionEachRound = random.nextBoolean();
+
+        List<List<TestRecord>> testRecords = new ArrayList<>();
+        List<List<String>> expected = new ArrayList<>();
+        Map<String, String> expectedMap = new LinkedHashMap<>();
+        for (int r = 0; r < numRounds; r++) {
+            List<TestRecord> round = new ArrayList<>();
+            for (int i = 0; i < numRecords; i++) {
+                int pt1 = (random.nextInt(0, samePartitionEachRound ? 1 : 2) + r) % 3;
+                String pt2 = String.valueOf(random.nextInt(10, 12));
+                String k = String.valueOf(random.nextInt(0, 100));
+                int v1 = random.nextInt();
+                long v2 = random.nextLong();
+                round.add(
+                        new TestRecord(
+                                binaryRow.apply(pt1, pt2),
+                                GenericRow.of(
+                                        pt1,
+                                        BinaryString.fromString(pt2),
+                                        BinaryString.fromString(k),
+                                        v1,
+                                        v2)));
+                expectedMap.put(
+                        String.format("%d, %s, %s", pt1, pt2, k), String.format("%d, %d", v1, v2));
+            }
+            testRecords.add(round);
+            expected.add(
+                    expectedMap.entrySet().stream()
+                            .map(e -> String.format("Record(%s, %s)", e.getKey(), e.getValue()))
+                            .collect(Collectors.toList()));
+        }
+
+        runCompatibilityTest(
+                rowType,
+                Arrays.asList("pt1", "pt2"),
+                Arrays.asList("pt1", "pt2", "k"),
+                testRecords,
+                expected,
+                Record::toString);
+
+        PartitionSpec expectedPartitionSpec = PartitionSpec.builderFor(new Schema()).build();
+        runPartitionSpecCompatibilityTest(expectedPartitionSpec);
+    }
+
+    @Test
+    public void testPartitionedPrimaryKeyTableWithNonZeroFieldId() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {
+                            DataTypes.STRING(),
+                            DataTypes.INT(),
+                            DataTypes.STRING(),
+                            DataTypes.INT(),
+                            DataTypes.BIGINT()
+                        },
+                        new String[] {
+                            "k", "pt1", "pt2", "v1", "v2"
+                        }); // partition starts from fieldId 1
+
+        BiFunction<Integer, String, BinaryRow> binaryRow =
+                (pt1, pt2) -> {
+                    BinaryRow b = new BinaryRow(2);
+                    BinaryRowWriter writer = new BinaryRowWriter(b);
+                    writer.writeInt(0, pt1);
+                    writer.writeString(1, BinaryString.fromString(pt2));
+                    writer.complete();
+                    return b;
+                };
+
+        int numRounds = 20;
+        int numRecords = 500;
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        boolean samePartitionEachRound = random.nextBoolean();
+
+        List<List<TestRecord>> testRecords = new ArrayList<>();
+        List<List<String>> expected = new ArrayList<>();
+        Map<String, String> expectedMap = new LinkedHashMap<>();
+        for (int r = 0; r < numRounds; r++) {
+            List<TestRecord> round = new ArrayList<>();
+            for (int i = 0; i < numRecords; i++) {
+                int pt1 = (random.nextInt(0, samePartitionEachRound ? 1 : 2) + r) % 3;
+                String pt2 = String.valueOf(random.nextInt(10, 12));
+                String k = String.valueOf(random.nextInt(0, 100));
+                int v1 = random.nextInt();
+                long v2 = random.nextLong();
+                round.add(
+                        new TestRecord(
+                                binaryRow.apply(pt1, pt2),
+                                GenericRow.of(
+                                        BinaryString.fromString(k),
+                                        pt1,
+                                        BinaryString.fromString(pt2),
+                                        v1,
+                                        v2)));
+                expectedMap.put(
+                        String.format("%s, %d, %s", k, pt1, pt2), String.format("%d, %d", v1, v2));
+            }
+            testRecords.add(round);
+            expected.add(
+                    expectedMap.entrySet().stream()
+                            .map(e -> String.format("Record(%s, %s)", e.getKey(), e.getValue()))
+                            .sorted()
+                            .collect(Collectors.toList()));
+        }
+
+        runCompatibilityTest(
+                rowType,
+                Arrays.asList("pt1", "pt2"),
+                Arrays.asList("k", "pt1", "pt2"),
+                testRecords,
+                expected,
+                Record::toString);
+
+        PartitionSpec expectedPartitionSpec =
+                PartitionSpec.builderFor(
+                                new Schema(
+                                        NestedField.required(1, "pt1", Types.IntegerType.get()),
+                                        NestedField.required(2, "pt2", Types.StringType.get())))
+                        .identity("pt1")
+                        .identity("pt2")
+                        .build();
+        runPartitionSpecCompatibilityTest(expectedPartitionSpec);
+    }
+
+    private void runCompatibilityTest(
+            RowType rowType,
+            List<String> partitionKeys,
+            List<String> primaryKeys,
+            List<List<TestRecord>> testRecords,
+            List<List<String>> expected,
+            Function<Record, String> icebergRecordToString)
+            throws Exception {
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        partitionKeys,
+                        primaryKeys,
+                        primaryKeys.isEmpty() ? -1 : 2,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        for (int r = 0; r < testRecords.size(); r++) {
+            List<TestRecord> round = testRecords.get(r);
+            for (TestRecord testRecord : round) {
+                write.write(testRecord.record);
+            }
+
+            if (!primaryKeys.isEmpty()) {
+                for (BinaryRow partition :
+                        round.stream().map(t -> t.partition).collect(Collectors.toSet())) {
+                    for (int b = 0; b < 2; b++) {
+                        write.compact(partition, b, true);
+                    }
+                }
+            }
+            commit.commit(r, write.prepareCommit(true, r));
+
+            assertThat(
+                            getIcebergResult(
+                                    icebergTable -> IcebergGenerics.read(icebergTable).build(),
+                                    icebergRecordToString))
+                    .hasSameElementsAs(expected.get(r));
+        }
+
+        write.close();
+        commit.close();
+    }
+
+    private void runPartitionSpecCompatibilityTest(PartitionSpec expectedSpec) {
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        PartitionSpec spec = icebergTable.spec();
+        assertThat(spec).isEqualTo(expectedSpec);
+    }
+
+    @Test
+    public void testSchemaAndPropertiesChange() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+        // change1: add a column
+        // change2: change 'metadata.iceberg.delete-after-commit.enabled' to false
+        // change3: change 'metadata.iceberg.previous-versions-max' to 10
+        schemaManager.commitChanges(
+                SchemaChange.addColumn("v2", DataTypes.STRING()),
+                SchemaChange.setOption(IcebergOptions.METADATA_DELETE_AFTER_COMMIT.key(), "false"),
+                SchemaChange.setOption(IcebergOptions.METADATA_PREVIOUS_VERSIONS_MAX.key(), "10"));
+        table = table.copy(table.schemaManager().latest().get());
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 11, BinaryString.fromString("one")));
+        write.write(GenericRow.of(3, 30, BinaryString.fromString("three")));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 11, one)", "Record(2, 20, null)", "Record(3, 30, three)");
+
+        write.write(GenericRow.of(2, 21, BinaryString.fromString("two")));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 11, one)", "Record(2, 21, two)", "Record(3, 30, three)");
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(5);
+        // 1 metadata for createTable + 4 history metadata
+        assertThat(((BaseTable) icebergTable).operations().current().previousFiles().size())
+                .isEqualTo(5);
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testCommitAfterSchemaRollback() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        table.createTag("before-evolution", 1);
+
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+        schemaManager.commitChanges(SchemaChange.addColumn("v2", DataTypes.STRING()));
+        table = table.copy(table.schemaManager().latest().get());
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(2, 20, BinaryString.fromString("two")));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+
+        TableCommitImpl rollbackCommit = table.newCommit(commitUser);
+        rollbackCommit.rollbackToAsLatest(table.tagManager().getOrThrow("before-evolution"));
+        rollbackCommit.close();
+
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10, null)");
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        System.out.println(
+                "PROBE catalog currentSchemaId="
+                        + ((org.apache.iceberg.BaseTable) icebergTable)
+                                .operations()
+                                .current()
+                                .currentSchemaId()
+                        + " schemas="
+                        + icebergTable.schemas().keySet()
+                        + " snapSchemaId="
+                        + icebergTable.currentSnapshot().schemaId());
+        long localLatest = table.snapshotManager().latestSnapshotId();
+        org.apache.paimon.iceberg.metadata.IcebergMetadata localMeta =
+                org.apache.paimon.iceberg.metadata.IcebergMetadata.fromPath(
+                        table.fileIO(),
+                        new org.apache.paimon.fs.Path(
+                                table.location().getParent().getParent(),
+                                "iceberg/mydb/t/metadata/v" + localLatest + ".metadata.json"));
+        System.out.println(
+                "PROBE local current="
+                        + localMeta.currentSchemaId()
+                        + " snapEntry="
+                        + localMeta.currentSnapshot().schemaId());
+        System.out.println(
+                "PROBE schemaLatest="
+                        + new FileSystemSchemaManager(table.fileIO(), table.location())
+                                .latest()
+                                .get()
+                                .id());
+        for (org.apache.paimon.fs.FileStatus st :
+                table.fileIO()
+                        .listStatus(
+                                new org.apache.paimon.fs.Path(
+                                        table.location().getParent().getParent(),
+                                        "iceberg/mydb/t/metadata"))) {
+            if (st.getPath().getName().endsWith(".metadata.json")) {
+                System.out.println("PROBE json: " + st.getPath().getName());
+            }
+        }
+        assertThat(icebergTable.schema().columns().stream().map(c -> c.name()))
+                .containsExactly("k", "v", "v2");
+        assertThat(icebergTable.currentSnapshot().schemaId()).isEqualTo(1);
+    }
+
+    @Test
+    public void testCustomTablePropertiesPassthrough() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.TABLE_PROPERTIES_PREFIX + "dd.table-color", "blue");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        customOptions);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        // Custom property should be set on initial table creation.
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties()).containsEntry("dd.table-color", "blue");
+
+        // Custom property should persist across a follow-up commit.
+        write.write(GenericRow.of(2, 20));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties()).containsEntry("dd.table-color", "blue");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testCustomTablePropertyCollidingWithReservedKeyIsIgnored() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        // "format-version" is an Iceberg-reserved property key; Iceberg's TableMetadata
+        // rejects it if present in a SetProperties update, so it must be filtered out
+        // rather than crashing the commit.
+        customOptions.put(IcebergOptions.TABLE_PROPERTIES_PREFIX + "format-version", "99");
+        customOptions.put(IcebergOptions.TABLE_PROPERTIES_PREFIX + "dd.table-color", "green");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        customOptions);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties()).containsEntry("dd.table-color", "green");
+        assertThat(icebergTable.properties()).doesNotContainKey("format-version");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testCustomTablePropertiesSurviveTableRecreate() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.TABLE_PROPERTIES_PREFIX + "dd.table-color", "blue");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        customOptions);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        write.write(GenericRow.of(1, 11));
+        write.write(GenericRow.of(3, 30));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        // Disable and re-enable Iceberg compatibility, forcing the REST committer down the
+        // updatesForIncorrectBase() -> recreateTable() (drop-and-recreate) path on the next
+        // commit, since the base metadata Paimon last wrote is now stale.
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "disabled");
+        table = table.copy(options);
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(4, 40));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+
+        options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "rest-catalog");
+        table = table.copy(options);
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(5, 50));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(4, write.prepareCommit(true, 4));
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.properties()).containsEntry("dd.table-color", "blue");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testOptionOnlyAlterTableDoesNotCrashIcebergSync() throws Exception {
+        // The fix deduplicates schemas in adjustMetadataForRest() and remaps
+        // currentSchemaId + snapshot schemaId references to the surviving ID.
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        // Initial write — establishes schema-0 in Paimon, schema-1 in Iceberg
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+
+        // Perform 3 option-only schema changes — each increments Paimon schema ID
+        // but does NOT change columns, creating the dedup scenario
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+        schemaManager.commitChanges(SchemaChange.setOption("my.custom.option.1", "value1"));
+        schemaManager.commitChanges(SchemaChange.setOption("my.custom.option.2", "value2"));
+        schemaManager.commitChanges(SchemaChange.setOption("my.custom.option.3", "value3"));
+        table = table.copy(table.schemaManager().latest().get());
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        // Write more data — this triggers IcebergRestMetadataCommitter with
+        // multiple schemas that have identical fields but different IDs.
+        // Without the fix, this crashes with "Cannot set current schema to
+        // unknown schema: N".
+        write.write(GenericRow.of(1, 11));
+        write.write(GenericRow.of(3, 30));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        // Verify data is readable through Iceberg
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+
+        // Verify schema dedup happened: Iceberg should have fewer schemas than
+        // Paimon (Paimon has 4 schemas: original + 3 option changes; Iceberg
+        // should have just 1 unique schema after dedup, plus the empty placeholder)
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        int icebergSchemaCount = icebergTable.schemas().size();
+        int paimonSchemaCount = table.schemaManager().listAllIds().size();
+        assertThat(icebergSchemaCount).isLessThan(paimonSchemaCount);
+
+        // Perform another write + commit to verify no drift on subsequent commits
+        // (the deduped currentSchemaId should match what Iceberg stored, so we
+        // should NOT re-enter the schema update path unnecessarily)
+        write.write(GenericRow.of(2, 21));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 21)", "Record(3, 30)");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testSchemaEvolutionWithInterleavedOptionAlter() throws Exception {
+        // Verifies correct behaviour across a full schema-evolution cycle:
+        //
+        //   1. Initial schema: [k, v1, v2]
+        //   2. Drop column v2: [k, v1]          — genuine schema change
+        //   3. Option-only alter on [k, v1]      — same fields; must be deduped with step 2
+        //   4. Re-add column v2 (BIGINT): [k, v1, v2_new] — new field ID; must NOT be
+        //      deduped with step 1 even though the column name matches
+        //
+        // Without the fix, step 3 crashes with "Cannot set current schema to unknown schema: N"
+        // and step 4 would expose a renumbering bug where Iceberg assigns sequential IDs
+        // (1, 2, 3) while setCurrentSchema references the gap-containing ID (4).
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT(), DataTypes.STRING()},
+                        new String[] {"k", "v1", "v2"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+        String commitUser = UUID.randomUUID().toString();
+        EvolveContext ctx = new EvolveContext(table, commitUser);
+
+        // Step 1: baseline
+        ctx.writeAndCommit(
+                GenericRow.of(1, 10, BinaryString.fromString("a")),
+                GenericRow.of(2, 20, BinaryString.fromString("b")));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10, a)", "Record(2, 20, b)");
+
+        // Step 2: drop v2 → [k, v1]
+        ctx.evolve(SchemaChange.dropColumn("v2"));
+        ctx.writeAndCommit(GenericRow.of(1, 11), GenericRow.of(3, 30));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+
+        // Step 3: option-only alter — same fields [k, v1], increments Paimon schema ID
+        ctx.evolve(SchemaChange.setOption("my.test.option", "trigger-dedup"));
+        ctx.writeAndCommit(GenericRow.of(2, 21));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 21)", "Record(3, 30)");
+
+        // Step 4: re-add v2 as BIGINT — new field ID, distinct from original v2 (STRING)
+        ctx.evolve(SchemaChange.addColumn("v2", DataTypes.BIGINT()));
+        ctx.writeAndCommit(GenericRow.of(1, 11, 100L), GenericRow.of(4, 40, 400L));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 11, 100)",
+                        "Record(2, 21, null)",
+                        "Record(3, 30, null)",
+                        "Record(4, 40, 400)");
+
+        // Final Iceberg schema must reflect [k, v1, v2_new(BIGINT)], not the old v2(STRING)
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.schema().columns()).hasSize(3);
+        assertThat(icebergTable.schema().findField("v2").type().toString()).isEqualTo("long");
+
+        // Paimon has 4 schema versions (0-3); step 3 is a duplicate of step 2 (same fields).
+        // Iceberg should have exactly 4 schemas: the empty placeholder (id=0) plus 3 unique
+        // field-sets. Without dedup it would have 5 (empty + one-per-Paimon-schema).
+        int paimonSchemaCount = ctx.table.schemaManager().listAllIds().size();
+        assertThat(paimonSchemaCount).isEqualTo(4);
+        assertThat(icebergTable.schemas().size()).isEqualTo(4); // 5 without dedup
+
+        ctx.close();
+    }
+
+    /** Helper context that keeps write/commit in sync with table schema evolution. */
+    private class EvolveContext implements AutoCloseable {
+        FileStoreTable table;
+        private final String commitUser;
+        private TableWriteImpl<?> write;
+        private TableCommitImpl commit;
+        private int seq = 0;
+
+        EvolveContext(FileStoreTable table, String commitUser) throws Exception {
+            this.table = table;
+            this.commitUser = commitUser;
+            this.write = table.newWrite(commitUser);
+            this.commit = table.newCommit(commitUser);
+        }
+
+        void evolve(SchemaChange change) throws Exception {
+            new FileSystemSchemaManager(table.fileIO(), table.location()).commitChanges(change);
+            table = table.copy(table.schemaManager().latest().get());
+            write.close();
+            write = table.newWrite(commitUser);
+            commit.close();
+            commit = table.newCommit(commitUser);
+        }
+
+        void writeAndCommit(GenericRow... rows) throws Exception {
+            for (GenericRow row : rows) {
+                write.write(row);
+            }
+            write.compact(BinaryRow.EMPTY_ROW, 0, true);
+            commit.commit(++seq, write.prepareCommit(true, seq));
+        }
+
+        @Override
+        public void close() throws Exception {
+            write.close();
+            commit.close();
+        }
+    }
+
+    @Test
+    public void testSchemaChangeBeforeSync() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "disabled");
+        // disable iceberg compatibility
+        FileStoreTable table =
+                createPaimonTable(
+                                rowType,
+                                Collections.emptyList(),
+                                Collections.singletonList("k"),
+                                1,
+                                randomFormat(),
+                                Collections.emptyMap())
+                        .copy(options);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        // schema change
+        SchemaManager schemaManager = new FileSystemSchemaManager(table.fileIO(), table.location());
+        schemaManager.commitChanges(SchemaChange.addColumn("v2", DataTypes.STRING()));
+        table = table.copyWithLatestSchema();
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 11, BinaryString.fromString("one")));
+        write.write(GenericRow.of(3, 30, BinaryString.fromString("three")));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        // enable iceberg compatibility
+        options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "rest-catalog");
+        table = table.copy(options);
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(4, 40, BinaryString.fromString("four")));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 11, one)",
+                        "Record(2, 20, null)",
+                        "Record(3, 30, three)",
+                        "Record(4, 40, four)");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testIcebergSnapshotExpire() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.SNAPSHOT_NUM_RETAINED_MIN.key(), "3");
+        options.put(CoreOptions.SNAPSHOT_NUM_RETAINED_MAX.key(), "3");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        options);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(1L);
+        FileIO fileIO = table.fileIO();
+        IcebergMetadata metadata =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v1.metadata.json"));
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(metadata.snapshots()).hasSize(1);
+        assertThat(metadata.currentSnapshotId()).isEqualTo(1);
+        // check table in rest-catalog
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(1);
+        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(1);
+
+        write.write(GenericRow.of(1, 11));
+        write.write(GenericRow.of(3, 30));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(3L);
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        metadata =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v3.metadata.json"));
+        assertThat(metadata.snapshots()).hasSize(3);
+        assertThat(metadata.currentSnapshotId()).isEqualTo(3);
+        // check table in rest-catalog
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(3);
+        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(3);
+
+        // Number of snapshots will become 5 with the next commit, however only 3 Iceberg snapshots
+        // are kept. So the first 2 Iceberg snapshots will be expired.
+
+        write.write(GenericRow.of(2, 21));
+        write.write(GenericRow.of(3, 31));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(5L);
+        metadata =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v5.metadata.json"));
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(metadata.snapshots()).hasSize(3);
+        assertThat(metadata.currentSnapshotId()).isEqualTo(5);
+        // check table in rest-catalog
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(5);
+        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(3);
+
+        write.close();
+        commit.close();
+
+        // The old metadata.json is removed when the new metadata.json is created
+        // depending on the old metadata retention configuration.
+        assertThat(((BaseTable) icebergTable).operations().current().previousFiles().size())
+                .isEqualTo(1);
+
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 21)", "Record(3, 31)");
+        assertThat(
+                        getIcebergResult(
+                                t -> IcebergGenerics.read(t).useSnapshot(3).build(),
+                                Record::toString))
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+        assertThat(
+                        getIcebergResult(
+                                t -> IcebergGenerics.read(t).useSnapshot(4).build(),
+                                Record::toString))
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+    }
+
+    @Test
+    public void testRetryAdvancesLaggingCatalogWithoutRecreate() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.close();
+        commit.close();
+
+        FileStoreTable localOnly =
+                table.copy(
+                        Collections.singletonMap(
+                                IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "hadoop-catalog"));
+        TableWriteImpl<?> write2 = localOnly.newWrite(commitUser);
+        TableCommitImpl commit2 = localOnly.newCommit(commitUser);
+        write2.write(GenericRow.of(2, 20));
+        commit2.commit(2, write2.prepareCommit(false, 2));
+        write2.close();
+        commit2.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(1);
+        icebergTable.updateProperties().set("user-custom-prop", "kept").commit();
+        String uuidBefore = ((BaseTable) icebergTable).operations().current().uuid();
+
+        IcebergCommitCallback callback = new IcebergCommitCallback(table, commitUser);
+        callback.retry(new org.apache.paimon.manifest.ManifestCommittable(2));
+        callback.close();
+
+        Table reloaded = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(((BaseTable) reloaded).operations().current().uuid()).isEqualTo(uuidBefore);
+        assertThat(reloaded.properties()).containsEntry("user-custom-prop", "kept");
+        assertThat(reloaded.currentSnapshot().snapshotId()).isEqualTo(2);
+    }
+
+    @Test
+    public void testAbandonedBaseWithSameIdIsNotExtendedInCatalog() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+
+        table.rollbackTo(1);
+        FileStoreTable localOnly =
+                table.copy(
+                        Collections.singletonMap(
+                                IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "hadoop-catalog"));
+        TableWriteImpl<?> write2 = localOnly.newWrite(commitUser);
+        TableCommitImpl commit2 = localOnly.newCommit(commitUser);
+        write2.write(GenericRow.of(3, 30));
+        commit2.commit(3, write2.prepareCommit(false, 3));
+        write2.close();
+        commit2.close();
+
+        TableWriteImpl<?> write3 = table.newWrite(commitUser);
+        TableCommitImpl commit3 = table.newCommit(commitUser);
+        write3.write(GenericRow.of(4, 40));
+        commit3.commit(4, write3.prepareCommit(false, 4));
+        write3.close();
+        commit3.close();
+
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(3, 30)", "Record(4, 40)");
+
+        org.apache.paimon.iceberg.metadata.IcebergMetadata localMetadata =
+                org.apache.paimon.iceberg.metadata.IcebergMetadata.fromPath(
+                        table.fileIO(),
+                        new org.apache.paimon.fs.Path(
+                                IcebergCommitCallback.catalogTableMetadataPath(table),
+                                "v3.metadata.json"));
+        String localIdentity =
+                localMetadata.snapshots().stream()
+                        .filter(snap -> snap.snapshotId() == 2)
+                        .findFirst()
+                        .get()
+                        .summary()
+                        .get("paimon-commit-identity");
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        org.apache.iceberg.Snapshot catalogSnapshot2 = icebergTable.snapshot(2);
+        if (catalogSnapshot2 != null) {
+            assertThat(catalogSnapshot2.summary().get("paimon-commit-identity"))
+                    .isEqualTo(localIdentity);
+        }
+    }
+
+    @Test
+    public void testIdempotentRetryDoesNotRecreateTable() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(false, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(false, 2));
+        write.close();
+        commit.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        icebergTable.updateProperties().set("user-custom-prop", "kept").commit();
+        String uuidBefore = ((BaseTable) icebergTable).operations().current().uuid();
+
+        IcebergCommitCallback callback = new IcebergCommitCallback(table, commitUser);
+        callback.retry(new org.apache.paimon.manifest.ManifestCommittable(2));
+        callback.close();
+
+        Table reloaded = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(((BaseTable) reloaded).operations().current().uuid()).isEqualTo(uuidBefore);
+        assertThat(reloaded.properties()).containsEntry("user-custom-prop", "kept");
+    }
+
+    @Test
+    public void testWithIncorrectBase() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        write.write(GenericRow.of(1, 11));
+        write.write(GenericRow.of(3, 30));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        // generate 3 metadata files in iceberg table, and current snapshot id is 3
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(3);
+
+        // disable iceberg compatibility
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "disabled");
+        table = table.copy(options);
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(4, 40));
+        write.write(GenericRow.of(5, 50));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(3, write.prepareCommit(true, 3));
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(5L);
+
+        // enable iceberg compatibility
+        options.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "rest-catalog");
+        table = table.copy(options);
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(6, 60));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(4, write.prepareCommit(true, 4));
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(7L);
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 11)",
+                        "Record(2, 20)",
+                        "Record(3, 30)",
+                        "Record(4, 40)",
+                        "Record(5, 50)",
+                        "Record(6, 60)");
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(7);
+        assertThat(ImmutableList.copyOf(icebergTable.snapshots()).size()).isEqualTo(2);
+
+        write.write(GenericRow.of(4, 41));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(5, write.prepareCommit(true, 5));
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 11)",
+                        "Record(2, 20)",
+                        "Record(3, 30)",
+                        "Record(4, 41)",
+                        "Record(5, 50)",
+                        "Record(6, 60)");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testWithExistedTableLocation() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> dynamicOptions = new HashMap<>();
+        dynamicOptions.put(
+                IcebergOptions.METADATA_ICEBERG_STORAGE_LOCATION.key(),
+                IcebergOptions.StorageLocation.TABLE_LOCATION.toString());
+        dynamicOptions.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "table-location");
+
+        FileStoreTable table =
+                createPaimonTable(
+                                rowType,
+                                Collections.emptyList(),
+                                Collections.singletonList("k"),
+                                1,
+                                "avro",
+                                Collections.emptyMap())
+                        .copy(dynamicOptions);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+        assertThat(table.fileIO().exists(new Path(table.location(), "metadata/v1.metadata.json")))
+                .isTrue();
+
+        dynamicOptions.put(IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "rest-catalog");
+        table = table.copy(dynamicOptions);
+        write.close();
+        write = table.newWrite(commitUser);
+        commit.close();
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 11));
+        write.write(GenericRow.of(3, 30));
+        write.compact(BinaryRow.EMPTY_ROW, 0, true);
+        commit.commit(2, write.prepareCommit(true, 2));
+        assertThat(table.fileIO().exists(new Path(table.location(), "metadata/v3.metadata.json")))
+                .isTrue();
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 11)", "Record(2, 20)", "Record(3, 30)");
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testParentSnapshotIdTracking() throws Exception {
+        // create and write with paimon client
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        // First commit - should have null parent snapshot ID
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(false, 1));
+
+        FileIO fileIO = table.fileIO();
+        IcebergMetadata metadata1 =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v1.metadata.json"));
+        assertThat(metadata1.snapshots()).hasSize(1);
+        assertThat(metadata1.snapshots().get(0).parentSnapshotId()).isNull();
+        assertThat(metadata1.snapshots().get(0).snapshotId()).isEqualTo(1);
+
+        // Second commit - should have parent snapshot ID pointing to first snapshot
+        write.write(GenericRow.of(1, 11));
+        write.write(GenericRow.of(3, 30));
+        commit.commit(2, write.prepareCommit(true, 2));
+
+        IcebergMetadata metadata2 =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v2.metadata.json"));
+        assertThat(metadata2.snapshots()).hasSize(2);
+        // The last snapshot should have parent pointing to the previous snapshot
+        IcebergSnapshot lastSnapshot = metadata2.snapshots().get(metadata2.snapshots().size() - 1);
+        assertThat(lastSnapshot.parentSnapshotId()).isEqualTo(1L);
+        assertThat(lastSnapshot.snapshotId()).isEqualTo(2);
+
+        // Third commit - should have parent snapshot ID pointing to second snapshot
+        write.write(GenericRow.of(2, 21));
+        write.write(GenericRow.of(4, 40));
+        commit.commit(3, write.prepareCommit(true, 3));
+
+        IcebergMetadata metadata3 =
+                IcebergMetadata.fromPath(
+                        fileIO, new Path(catalogTableMetadataPath(table), "v3.metadata.json"));
+        assertThat(metadata3.snapshots()).hasSize(3);
+        // The last snapshot should have parent pointing to the previous snapshot
+        IcebergSnapshot lastSnapshot3 = metadata3.snapshots().get(metadata3.snapshots().size() - 1);
+        assertThat(lastSnapshot3.parentSnapshotId()).isEqualTo(2L);
+        assertThat(lastSnapshot3.snapshotId()).isEqualTo(3);
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testCreateDatabaseIsIdempotentUnderRace() throws Exception {
+        // Two commits targeting the same namespace can both observe it as missing and both
+        // call createNamespace() (the check-then-act race in commitMetadataImpl). The loser
+        // must not fail. Here the second createDatabase() hits an already-existing namespace.
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.singletonList("k"),
+                        1,
+                        randomFormat(),
+                        Collections.emptyMap());
+
+        IcebergRestMetadataCommitter committer = new IcebergRestMetadataCommitter(table);
+        committer.createDatabase();
+        committer.createDatabase();
+        assertThat(restCatalog.namespaceExists(Namespace.of("mydb"))).isTrue();
+    }
+
+    @Test
+    public void testToRestLocationNormalisesScheme() {
+        // s3a:// and legacy s3n:// are rewritten to s3:// (Glue's REST endpoint only accepts
+        // s3://).
+        assertThat(IcebergRestMetadataCommitter.toRestLocation("s3a://bucket/db/t"))
+                .isEqualTo("s3://bucket/db/t");
+        assertThat(IcebergRestMetadataCommitter.toRestLocation("s3n://bucket/db/t"))
+                .isEqualTo("s3://bucket/db/t");
+        // s3:// and other schemes pass through unchanged; null is preserved.
+        assertThat(IcebergRestMetadataCommitter.toRestLocation("s3://bucket/db/t"))
+                .isEqualTo("s3://bucket/db/t");
+        assertThat(IcebergRestMetadataCommitter.toRestLocation("file:///tmp/db/t"))
+                .isEqualTo("file:///tmp/db/t");
+        assertThat(IcebergRestMetadataCommitter.toRestLocation(null)).isNull();
+    }
+
+    @Test
+    public void testFormatVersion3TableRegistersV3() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        customOptions);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(true, 1));
+
+        write.write(GenericRow.of(3, 30));
+        commit.commit(2, write.prepareCommit(true, 2));
+        write.close();
+        commit.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(TableUtil.formatVersion(icebergTable)).isEqualTo(3);
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)", "Record(3, 30)");
+    }
+
+    @Test
+    public void testUpgradeFormatVersionOnRestTable() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        new HashMap<>());
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.close();
+        commit.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(TableUtil.formatVersion(icebergTable)).isEqualTo(2);
+
+        // upgrade paimon side to format-version 3
+        Map<String, String> upgrade = new HashMap<>();
+        upgrade.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        table = table.copy(upgrade);
+        write = table.newWrite(commitUser);
+        commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(3, 30));
+        commit.commit(2, write.prepareCommit(true, 2));
+        write.close();
+        commit.close();
+
+        icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(TableUtil.formatVersion(icebergTable)).isEqualTo(3);
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)", "Record(3, 30)");
+    }
+
+    @Test
+    public void testRecreateWithNonZeroLineageWatermark() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        customOptions);
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.write(GenericRow.of(3, 30));
+        commit.commit(2, write.prepareCommit(true, 2));
+        // local lineage watermark is now 3
+
+        // simulate external table loss: the committer must recreate the server table
+        // while the locally emitted snapshot carries a nonzero first-row-id
+        restCatalog.dropTable(TableIdentifier.of("mydb", "t"), false);
+
+        write.write(GenericRow.of(4, 40));
+        commit.commit(3, write.prepareCommit(true, 3));
+        write.close();
+        commit.close();
+
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(TableUtil.formatVersion(icebergTable)).isEqualTo(3);
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder(
+                        "Record(1, 10)", "Record(2, 20)", "Record(3, 30)", "Record(4, 40)");
+        // Known Layer 1 limitation (documented in the spec): the server-side next-row-id
+        // watermark restarts on recreation and stays behind the local metadata; commits
+        // must keep succeeding regardless (validation is first-row-id >= next-row-id).
+
+        // reader-visible lineage from the REST catalog matches the file-based mirror:
+        // snapshot first-row-id and manifest assignments come from local metadata, never
+        // from the server's table-level watermark. Compare by value, not just non-nullity,
+        // against the locally-written IcebergMetadata + manifest list under the paimon
+        // table's own metadata dir (catalogTableMetadataPath), which is the source of truth
+        // the REST-registered table's metadata-location actually points at.
+        long latestSnapshotId = table.snapshotManager().latestSnapshotId();
+        IcebergMetadata localMetadata =
+                IcebergMetadata.fromPath(
+                        table.fileIO(),
+                        new Path(
+                                catalogTableMetadataPath(table),
+                                String.format("v%d.metadata.json", latestSnapshotId)));
+        IcebergSnapshot localSnapshot = localMetadata.currentSnapshot();
+        assertThat(localSnapshot.firstRowId()).isNotNull();
+
+        IcebergPathFactory pathFactory = new IcebergPathFactory(catalogTableMetadataPath(table));
+        IcebergManifestList localManifestList = IcebergManifestList.create(table, pathFactory);
+        List<Long> localDataManifestFirstRowIds =
+                localManifestList.read(new Path(localSnapshot.manifestList()).getName()).stream()
+                        .filter(m -> m.content() == IcebergManifestFileMeta.Content.DATA)
+                        .map(IcebergManifestFileMeta::firstRowId)
+                        .collect(Collectors.toList());
+        assertThat(localDataManifestFirstRowIds).isNotEmpty().doesNotContainNull();
+
+        Table reloaded = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        assertThat(reloaded.currentSnapshot().firstRowId()).isEqualTo(localSnapshot.firstRowId());
+        // manifest-level first_row_id is only exposed by the GA (1.10+) reader API
+        if (GA_ROW_LINEAGE_READER) {
+            List<Long> restDataManifestFirstRowIds = new ArrayList<>();
+            for (ManifestFile manifest : reloaded.currentSnapshot().dataManifests(reloaded.io())) {
+                assertThat(manifestFirstRowId(manifest)).isNotNull();
+                restDataManifestFirstRowIds.add(manifestFirstRowId(manifest));
+            }
+            assertThat(restDataManifestFirstRowIds)
+                    .containsExactlyInAnyOrderElementsOf(localDataManifestFirstRowIds);
+
+            // the registered server table must carry the full row-id high-water mark:
+            // external REST writers allocate from it, so anything lower reuses ids
+            Long serverNextRowId =
+                    tableMetadataNextRowId(((BaseTable) reloaded).operations().current());
+            assertThat(serverNextRowId).isNotNull();
+            assertThat(serverNextRowId).isGreaterThanOrEqualTo(localMetadata.nextRowId());
+
+            // one external append through the Iceberg API allocates above the watermark
+            reloaded.newAppend().commit();
+            Table afterExternal = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+            assertThat(afterExternal.currentSnapshot().firstRowId())
+                    .isGreaterThanOrEqualTo(localMetadata.nextRowId());
+        }
+    }
+
+    /**
+     * Some REST catalogs (AWS Glue's Iceberg REST endpoint, for one) implement create, load, update
+     * and delete but not registerTable. Simulated by removing the endpoint from the set the client
+     * took from the server's config response.
+     */
+    @Test
+    public void testWithoutRegisterTableEndpoint() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        customOptions);
+        // Iceberg metadata is only produced locally; the committer under test publishes it
+        FileStoreTable localTable =
+                table.copy(
+                        Collections.singletonMap(
+                                IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "table-location"));
+        TableIdentifier identifier = TableIdentifier.of("mydb", "t");
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = localTable.newWrite(commitUser);
+        TableCommitImpl commit = localTable.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.write(GenericRow.of(3, 30));
+        commit.commit(2, write.prepareCommit(true, 2));
+        IcebergMetadata v1 = localMetadata(localTable, 1);
+        IcebergMetadata v2 = localMetadata(localTable, 2);
+
+        IcebergRestMetadataCommitter committer = new IcebergRestMetadataCommitter(table);
+        removeRegisterTableEndpoint(committer);
+
+        // zero-based v3 metadata publishes through the create/update path every catalog has
+        assertThat(v1.currentSnapshot().firstRowId()).isEqualTo(0L);
+        committer.commitMetadata(v1, null);
+        committer.commitMetadata(v2, v1);
+        Table icebergTable = restCatalog.loadTable(identifier);
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
+        assertThat(TableUtil.formatVersion(icebergTable)).isEqualTo(3);
+        assertThat(getIcebergResult())
+                .containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)", "Record(3, 30)");
+
+        // a rebuild whose row-id space does not start at 0 can only be published by
+        // registration: fail closed and leave the catalog table untouched
+        write.write(GenericRow.of(4, 40));
+        commit.commit(3, write.prepareCommit(true, 3));
+        IcebergMetadata v3 = localMetadata(localTable, 3);
+        assertThat(v3.currentSnapshot().firstRowId()).isEqualTo(3L);
+        assertThatThrownBy(() -> committer.commitMetadata(v3, null))
+                .hasStackTraceContaining("does not advertise registerTable");
+        assertThat(restCatalog.loadTable(identifier).currentSnapshot().snapshotId()).isEqualTo(2);
+        assertThat(registerFiles(localTable)).isEmpty();
+
+        // the same metadata is a plain update when the base is correct
+        committer.commitMetadata(v3, v2);
+        assertThat(restCatalog.loadTable(identifier).currentSnapshot().snapshotId()).isEqualTo(3);
+
+        // recreating a lost table needs registration as well: nothing is created
+        restCatalog.dropTable(identifier, false);
+        write.write(GenericRow.of(5, 50));
+        commit.commit(4, write.prepareCommit(true, 4));
+        IcebergMetadata v4 = localMetadata(localTable, 4);
+        assertThatThrownBy(() -> committer.commitMetadata(v4, v3))
+                .hasStackTraceContaining("does not advertise registerTable");
+        assertThat(restCatalog.tableExists(identifier)).isFalse();
+
+        write.close();
+        commit.close();
+    }
+
+    @Test
+    public void testRecreateWithoutRegisterTableEndpointOnV2() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        Collections.emptyMap());
+        FileStoreTable localTable =
+                table.copy(
+                        Collections.singletonMap(
+                                IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "table-location"));
+        TableIdentifier identifier = TableIdentifier.of("mydb", "t");
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = localTable.newWrite(commitUser);
+        TableCommitImpl commit = localTable.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(true, 2));
+        write.close();
+        commit.close();
+        IcebergMetadata v1 = localMetadata(localTable, 1);
+        IcebergMetadata v2 = localMetadata(localTable, 2);
+
+        IcebergRestMetadataCommitter committer = new IcebergRestMetadataCommitter(table);
+        removeRegisterTableEndpoint(committer);
+
+        committer.commitMetadata(v1, null);
+        assertThat(restCatalog.loadTable(identifier).currentSnapshot().snapshotId()).isEqualTo(1);
+        // no base: the table is dropped and recreated, which needs no registration on v2
+        committer.commitMetadata(v2, null);
+        Table icebergTable = restCatalog.loadTable(identifier);
+        assertThat(icebergTable.currentSnapshot().snapshotId()).isEqualTo(2);
+        assertThat(TableUtil.formatVersion(icebergTable)).isEqualTo(2);
+        assertThat(getIcebergResult()).containsExactlyInAnyOrder("Record(1, 10)", "Record(2, 20)");
+        assertThat(registerFiles(localTable)).isEmpty();
+    }
+
+    /**
+     * A catalog may keep referencing the registered metadata location, and rollback and rebuild
+     * paths reuse Paimon snapshot ids, so every registration writes a new file and never replaces
+     * an existing one.
+     */
+    @Test
+    public void testRegisteredMetadataFilesAreWriteOnce() throws Exception {
+        RowType rowType =
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"});
+        Map<String, String> customOptions = new HashMap<>();
+        customOptions.put(IcebergOptions.FORMAT_VERSION.key(), "3");
+        FileStoreTable table =
+                createPaimonTable(
+                        rowType,
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        -1,
+                        "avro",
+                        customOptions);
+        TableIdentifier identifier = TableIdentifier.of("mydb", "t");
+
+        String commitUser = UUID.randomUUID().toString();
+        TableWriteImpl<?> write = table.newWrite(commitUser);
+        TableCommitImpl commit = table.newCommit(commitUser);
+        write.write(GenericRow.of(1, 10));
+        commit.commit(1, write.prepareCommit(true, 1));
+        write.write(GenericRow.of(2, 20));
+        commit.commit(2, write.prepareCommit(true, 2));
+        IcebergMetadata v2 = localMetadata(table, 2);
+        assertThat(registerFiles(table)).isEmpty();
+
+        // the lost table is recreated by registration
+        restCatalog.dropTable(identifier, false);
+        write.write(GenericRow.of(3, 30));
+        commit.commit(3, write.prepareCommit(true, 3));
+        write.close();
+        commit.close();
+        IcebergMetadata v3 = localMetadata(table, 3);
+        assertThat(restCatalog.loadTable(identifier).currentSnapshot().snapshotId()).isEqualTo(3);
+        List<Path> firstRegistration = registerFiles(table);
+        assertThat(firstRegistration).hasSize(1);
+        assertThat(firstRegistration.get(0).getName()).startsWith("rest-register-v3-");
+        String firstContent = table.fileIO().readFileUtf8(firstRegistration.get(0));
+
+        // registering the same snapshot id again writes a second file, the first is untouched
+        restCatalog.dropTable(identifier, false);
+        new IcebergRestMetadataCommitter(table).commitMetadata(v3, v2);
+        assertThat(restCatalog.loadTable(identifier).currentSnapshot().snapshotId()).isEqualTo(3);
+        List<Path> registrations = registerFiles(table);
+        assertThat(registrations).hasSize(2).contains(firstRegistration.get(0));
+        assertThat(table.fileIO().readFileUtf8(firstRegistration.get(0))).isEqualTo(firstContent);
+        for (Path path : registrations) {
+            assertThat(path.getName()).startsWith("rest-register-v3-");
+            assertThat(IcebergMetadata.fromPath(table.fileIO(), path).currentSnapshotId())
+                    .isEqualTo(3);
+        }
+    }
+
+    @Test
+    public void testUnknownHostRetriesWithExponentialBackoff() throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.UNKNOWN_HOST_RETRY_MAX_RETRIES.key(), "2");
+        options.put(IcebergOptions.UNKNOWN_HOST_RETRY_INITIAL_DELAY_MILLIS.key(), "7");
+        FileStoreTable table = createRetryTestTable(options);
+        IcebergMetadata metadata = writeLocalMetadata(table);
+        TestingIcebergRestMetadataCommitter committer =
+                new TestingIcebergRestMetadataCommitter(
+                        table,
+                        2,
+                        new RuntimeException(new UnknownHostException("simulated DNS failure")));
+
+        committer.commitMetadata(metadata, null);
+
+        assertThat(committer.attempts).isEqualTo(3);
+        assertThat(committer.delays).containsExactly(7L, 14L);
+        assertThat(
+                        restCatalog
+                                .loadTable(TableIdentifier.of("mydb", "t"))
+                                .currentSnapshot()
+                                .snapshotId())
+                .isEqualTo(1);
+    }
+
+    @Test
+    public void testUnknownHostRetryExhaustionFailsCommit() throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.UNKNOWN_HOST_RETRY_MAX_RETRIES.key(), "1");
+        options.put(IcebergOptions.UNKNOWN_HOST_RETRY_INITIAL_DELAY_MILLIS.key(), "7");
+        FileStoreTable table = createRetryTestTable(options);
+        IcebergMetadata metadata = writeLocalMetadata(table);
+        TestingIcebergRestMetadataCommitter committer =
+                new TestingIcebergRestMetadataCommitter(
+                        table,
+                        Integer.MAX_VALUE,
+                        new RuntimeException(new UnknownHostException("simulated DNS failure")));
+
+        assertThatThrownBy(() -> committer.commitMetadata(metadata, null))
+                .hasRootCauseInstanceOf(UnknownHostException.class);
+        assertThat(committer.attempts).isEqualTo(2);
+        assertThat(committer.delays).containsExactly(7L);
+        assertThat(restCatalog.tableExists(TableIdentifier.of("mydb", "t"))).isFalse();
+    }
+
+    @Test
+    public void testZeroUnknownHostRetriesPreservesImmediateFailure() throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(IcebergOptions.UNKNOWN_HOST_RETRY_MAX_RETRIES.key(), "0");
+        FileStoreTable table = createRetryTestTable(options);
+        IcebergMetadata metadata = writeLocalMetadata(table);
+        TestingIcebergRestMetadataCommitter committer =
+                new TestingIcebergRestMetadataCommitter(
+                        table,
+                        Integer.MAX_VALUE,
+                        new RuntimeException(new UnknownHostException("simulated DNS failure")));
+
+        assertThatThrownBy(() -> committer.commitMetadata(metadata, null))
+                .hasRootCauseInstanceOf(UnknownHostException.class);
+        assertThat(committer.attempts).isEqualTo(1);
+        assertThat(committer.delays).isEmpty();
+    }
+
+    @Test
+    public void testNonDnsFailureIsNotRetried() throws Exception {
+        FileStoreTable table = createRetryTestTable(Collections.emptyMap());
+        IcebergMetadata metadata = writeLocalMetadata(table);
+        TestingIcebergRestMetadataCommitter committer =
+                new TestingIcebergRestMetadataCommitter(
+                        table, Integer.MAX_VALUE, new IllegalStateException("catalog failure"));
+
+        assertThatThrownBy(() -> committer.commitMetadata(metadata, null))
+                .hasRootCauseInstanceOf(IllegalStateException.class);
+        assertThat(committer.attempts).isEqualTo(1);
+        assertThat(committer.delays).isEmpty();
+    }
+
+    private FileStoreTable createRetryTestTable(Map<String, String> options) throws Exception {
+        restCatalog.dropTable(TableIdentifier.of("mydb", "t"), false);
+        return createPaimonTable(
+                RowType.of(
+                        new DataType[] {DataTypes.INT(), DataTypes.INT()}, new String[] {"k", "v"}),
+                Collections.emptyList(),
+                Collections.emptyList(),
+                -1,
+                "avro",
+                options);
+    }
+
+    private static IcebergMetadata writeLocalMetadata(FileStoreTable table) throws Exception {
+        FileStoreTable localTable =
+                table.copy(
+                        Collections.singletonMap(
+                                IcebergOptions.METADATA_ICEBERG_STORAGE.key(), "table-location"));
+        String commitUser = UUID.randomUUID().toString();
+        try (TableWriteImpl<?> write = localTable.newWrite(commitUser);
+                TableCommitImpl commit = localTable.newCommit(commitUser)) {
+            write.write(GenericRow.of(1, 10));
+            commit.commit(1, write.prepareCommit(true, 1));
+        }
+        return localMetadata(localTable, 1);
+    }
+
+    private static class TestingIcebergRestMetadataCommitter extends IcebergRestMetadataCommitter {
+
+        private int failuresRemaining;
+        private final RuntimeException failure;
+        private int attempts;
+        private final List<Long> delays = new ArrayList<>();
+
+        private TestingIcebergRestMetadataCommitter(
+                FileStoreTable table, int failures, RuntimeException failure) {
+            super(table);
+            this.failuresRemaining = failures;
+            this.failure = failure;
+        }
+
+        @Override
+        protected void commitMetadataImpl(
+                IcebergMetadata newIcebergMetadata, @Nullable IcebergMetadata baseIcebergMetadata) {
+            attempts++;
+            if (failuresRemaining > 0) {
+                failuresRemaining--;
+                throw failure;
+            }
+            super.commitMetadataImpl(newIcebergMetadata, baseIcebergMetadata);
+        }
+
+        @Override
+        protected void sleepBeforeUnknownHostRetry(long delayMillis) {
+            delays.add(delayMillis);
+        }
+    }
+
+    private static IcebergMetadata localMetadata(FileStoreTable table, long snapshotId) {
+        return IcebergMetadata.fromPath(
+                table.fileIO(),
+                new Path(
+                        catalogTableMetadataPath(table),
+                        String.format("v%d.metadata.json", snapshotId)));
+    }
+
+    private static List<Path> registerFiles(FileStoreTable table) throws Exception {
+        List<Path> files = new ArrayList<>();
+        for (org.apache.paimon.fs.FileStatus status :
+                table.fileIO().listStatus(catalogTableMetadataPath(table))) {
+            if (status.getPath().getName().startsWith("rest-register-")) {
+                files.add(status.getPath());
+            }
+        }
+        return files;
+    }
+
+    /** Makes the committer's REST client see a server that does not advertise registerTable. */
+    private static void removeRegisterTableEndpoint(IcebergRestMetadataCommitter committer)
+            throws Exception {
+        java.lang.reflect.Field catalogField =
+                IcebergRestMetadataCommitter.class.getDeclaredField("restCatalog");
+        catalogField.setAccessible(true);
+        Object restCatalog = catalogField.get(committer);
+        java.lang.reflect.Field sessionField = RESTCatalog.class.getDeclaredField("sessionCatalog");
+        sessionField.setAccessible(true);
+        Object sessionCatalog = sessionField.get(restCatalog);
+        java.lang.reflect.Field endpointsField =
+                sessionCatalog.getClass().getDeclaredField("endpoints");
+        endpointsField.setAccessible(true);
+        Set<Endpoint> endpoints = new HashSet<>((Set<Endpoint>) endpointsField.get(sessionCatalog));
+        assertThat(endpoints.remove(Endpoint.V1_REGISTER_TABLE)).isTrue();
+        endpointsField.set(sessionCatalog, endpoints);
+    }
+
+    private static class TestRecord {
+        private final BinaryRow partition;
+        private final GenericRow record;
+
+        private TestRecord(BinaryRow partition, GenericRow record) {
+            this.partition = partition;
+            this.record = record;
+        }
+    }
+
+    private FileStoreTable createPaimonTable(
+            RowType rowType,
+            List<String> partitionKeys,
+            List<String> primaryKeys,
+            int numBuckets,
+            String fileFormat,
+            Map<String, String> customOptions)
+            throws Exception {
+        LocalFileIO fileIO = LocalFileIO.create();
+        org.apache.paimon.fs.Path path = new org.apache.paimon.fs.Path(tempDir.toString());
+
+        Options options = new Options(customOptions);
+        options.set(CoreOptions.BUCKET, numBuckets);
+        options.set(
+                IcebergOptions.METADATA_ICEBERG_STORAGE, IcebergOptions.StorageType.REST_CATALOG);
+        options.set(CoreOptions.FILE_FORMAT, fileFormat);
+        options.set(CoreOptions.TARGET_FILE_SIZE, MemorySize.ofKibiBytes(32));
+        options.set(IcebergOptions.COMPACT_MIN_FILE_NUM, 4);
+        options.set(IcebergOptions.COMPACT_MIN_FILE_NUM, 8);
+        options.set(IcebergOptions.METADATA_DELETE_AFTER_COMMIT, true);
+        options.set(IcebergOptions.METADATA_PREVIOUS_VERSIONS_MAX, 1);
+        options.set(CoreOptions.MANIFEST_TARGET_FILE_SIZE, MemorySize.ofKibiBytes(8));
+
+        // rest-catalog options
+        options.set(
+                IcebergOptions.REST_CONFIG_PREFIX + CatalogProperties.URI,
+                restCatalog.properties().get(CatalogProperties.URI));
+        options.set(
+                IcebergOptions.REST_CONFIG_PREFIX + CatalogProperties.WAREHOUSE_LOCATION,
+                restCatalog.properties().get(CatalogProperties.WAREHOUSE_LOCATION));
+        options.set(
+                IcebergOptions.REST_CONFIG_PREFIX + CatalogProperties.CLIENT_POOL_SIZE,
+                restCatalog.properties().get(CatalogProperties.CLIENT_POOL_SIZE));
+
+        org.apache.paimon.schema.Schema schema =
+                new org.apache.paimon.schema.Schema(
+                        rowType.getFields(), partitionKeys, primaryKeys, options.toMap(), "");
+
+        try (FileSystemCatalog paimonCatalog = new FileSystemCatalog(fileIO, path)) {
+            paimonCatalog.createDatabase("mydb", false);
+            Identifier paimonIdentifier = Identifier.create("mydb", "t");
+            paimonCatalog.createTable(paimonIdentifier, schema, false);
+            return (FileStoreTable) paimonCatalog.getTable(paimonIdentifier);
+        }
+    }
+
+    private List<String> getIcebergResult() throws Exception {
+        return getIcebergResult(
+                icebergTable -> IcebergGenerics.read(icebergTable).build(), Record::toString);
+    }
+
+    private List<String> getIcebergResult(
+            Function<Table, CloseableIterable<Record>> query,
+            Function<Record, String> icebergRecordToString)
+            throws Exception {
+        Table icebergTable = restCatalog.loadTable(TableIdentifier.of("mydb", "t"));
+        CloseableIterable<Record> result = query.apply(icebergTable);
+        List<String> actual = new ArrayList<>();
+        for (Record record : result) {
+            actual.add(icebergRecordToString.apply(record));
+        }
+        result.close();
+        return actual;
+    }
+
+    private String randomFormat() {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        int i = random.nextInt(3);
+        String[] formats = new String[] {"orc", "parquet", "avro"};
+        return formats[i];
+    }
+
+    /** See IcebergRowLineageCompatibilityTest: GA reader API (1.10+) looked up reflectively. */
+    private static final boolean GA_ROW_LINEAGE_READER = detectGaRowLineageReader();
+
+    private static boolean detectGaRowLineageReader() {
+        try {
+            ManifestFile.class.getMethod("firstRowId");
+            return true;
+        } catch (NoSuchMethodException e) {
+            return false;
+        }
+    }
+
+    private static Long manifestFirstRowId(ManifestFile manifest) {
+        try {
+            return (Long) ManifestFile.class.getMethod("firstRowId").invoke(manifest);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** TableMetadata#nextRowId is a GA (1.10+) API; resolve reflectively. */
+    private static Long tableMetadataNextRowId(TableMetadata metadata) {
+        try {
+            return (Long) TableMetadata.class.getMethod("nextRowId").invoke(metadata);
+        } catch (NoSuchMethodException e) {
+            return null;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}

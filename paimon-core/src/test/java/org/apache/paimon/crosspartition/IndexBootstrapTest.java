@@ -1,0 +1,350 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.crosspartition;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.catalog.TableQueryAuthResult;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.data.Timestamp;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.manifest.FileSource;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.predicate.FieldRef;
+import org.apache.paimon.predicate.FieldTransform;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.reader.RecordReader;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.DelegatedFileStoreTable;
+import org.apache.paimon.table.FallbackReadFileStoreTable;
+import org.apache.paimon.table.FallbackReadFileStoreTable.FallbackSplit;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.TableTestBase;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.DataTableScan;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.JsonSerdeUtil;
+import org.apache.paimon.utils.Pair;
+
+import org.junit.jupiter.api.Test;
+import org.mockito.AdditionalAnswers;
+import org.mockito.Mockito;
+
+import java.time.Instant;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Consumer;
+
+import static org.apache.paimon.crosspartition.IndexBootstrap.BUCKET_FIELD;
+import static org.apache.paimon.crosspartition.IndexBootstrap.filterSplit;
+import static org.apache.paimon.data.BinaryRow.EMPTY_ROW;
+import static org.apache.paimon.stats.SimpleStats.EMPTY_STATS;
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** Test for {@link org.apache.paimon.crosspartition.IndexBootstrap}. */
+public class IndexBootstrapTest extends TableTestBase {
+
+    @Test
+    public void testBoostrap() throws Exception {
+        Table table = createTable();
+
+        write(
+                table,
+                row(1, 1, 1, 2),
+                row(1, 2, 2, 3),
+                row(1, 3, 3, 4),
+                row(2, 4, 4, 5),
+                row(2, 5, 5, 6),
+                row(3, 6, 6, 7),
+                row(3, 7, 7, 8));
+
+        IndexBootstrap indexBootstrap = new IndexBootstrap((FileStoreTable) table);
+        List<GenericRow> result = new ArrayList<>();
+        Consumer<InternalRow> consumer =
+                row -> result.add(GenericRow.of(row.getInt(0), row.getInt(1), row.getInt(2)));
+
+        // output key and bucket
+
+        indexBootstrap.bootstrap(2, 0, consumer);
+        assertThat(result)
+                .containsExactlyInAnyOrder(
+                        GenericRow.of(7, 3, 8),
+                        GenericRow.of(5, 2, 6),
+                        GenericRow.of(1, 1, 2),
+                        GenericRow.of(3, 1, 4));
+        result.clear();
+
+        indexBootstrap.bootstrap(2, 1, consumer);
+        assertThat(result)
+                .containsExactlyInAnyOrder(
+                        GenericRow.of(2, 1, 3), GenericRow.of(4, 2, 5), GenericRow.of(6, 3, 7));
+        result.clear();
+    }
+
+    private Table createTable() throws Exception {
+        return createTable("T");
+    }
+
+    private Table createTable(String tableName) throws Exception {
+        Identifier identifier = identifier(tableName);
+        Options options = new Options();
+        options.set(CoreOptions.BUCKET, -1);
+        Schema schema =
+                Schema.newBuilder()
+                        .column("pt", DataTypes.INT())
+                        .column("col", DataTypes.INT())
+                        .column("pk", DataTypes.INT())
+                        .primaryKey("pk")
+                        .partitionKeys("pt")
+                        .options(options.toMap())
+                        .build();
+        catalog.createTable(identifier, schema, true);
+        return catalog.getTable(identifier);
+    }
+
+    @Test
+    public void testBootstrapType() throws Exception {
+        FileStoreTable table = (FileStoreTable) createTable();
+        RowType indexRowType = IndexBootstrap.bootstrapType(table.schema());
+        assertThat(indexRowType.getFieldNames()).contains(BUCKET_FIELD);
+        assertThat(indexRowType.getFieldIndex(BUCKET_FIELD))
+                .isEqualTo(2); // the last field is bucket, which is not in table schema
+    }
+
+    @Test
+    public void testFilterSplit() {
+        assertThat(filterSplit(newSplit(newFile(100), newFile(200)), 50, 230)).isTrue();
+        assertThat(filterSplit(newSplit(newFile(100), newFile(200)), 50, 300)).isFalse();
+        assertThat(filterSplit(newSplit(newFile(100), newFile(200)), 200, 230)).isTrue();
+    }
+
+    @Test
+    public void testFallbackDataSplit() {
+        DataSplit dataSplit = newSplit(newFile(100), newFile(200));
+        FallbackSplit fallbackSplit = FallbackReadFileStoreTable.toFallbackSplit(dataSplit, true);
+
+        assertThat(fallbackSplit).isInstanceOf(DataSplit.class);
+        assertThat(filterSplit(fallbackSplit, 50, 230)).isTrue();
+        assertThat(filterSplit(fallbackSplit, 50, 300)).isFalse();
+        assertThat(fallbackSplit.isFallback()).isTrue();
+    }
+
+    @Test
+    public void testBootstrapIgnoresQueryAuth() throws Exception {
+        FileStoreTable table = (FileStoreTable) createTable();
+        write(
+                table,
+                row(1, 1, 1, 2),
+                row(1, 2, 2, 3),
+                row(1, 3, 3, 4),
+                row(2, 4, 4, 5),
+                row(2, 5, 5, 6),
+                row(3, 6, 6, 7),
+                row(3, 7, 7, 8));
+
+        TableQueryAuthResult authResult = queryAuthResult(table);
+        IndexBootstrap indexBootstrap =
+                new IndexBootstrap(new QueryAuthFileStoreTable(table, authResult));
+
+        List<GenericRow> result = new ArrayList<>();
+        try (RecordReader<InternalRow> reader = indexBootstrap.bootstrap(1, 0)) {
+            reader.forEachRemaining(
+                    row -> result.add(GenericRow.of(row.getInt(0), row.getInt(1), row.getInt(2))));
+        }
+
+        assertThat(result)
+                .containsExactlyInAnyOrder(
+                        GenericRow.of(1, 1, 2),
+                        GenericRow.of(2, 1, 3),
+                        GenericRow.of(3, 1, 4),
+                        GenericRow.of(4, 2, 5),
+                        GenericRow.of(5, 2, 6),
+                        GenericRow.of(6, 3, 7),
+                        GenericRow.of(7, 3, 8));
+    }
+
+    @Test
+    public void testBootstrapIgnoresQueryAuthWithFallback() throws Exception {
+        FileStoreTable mainTable = (FileStoreTable) createTable("MAIN");
+        FileStoreTable fallbackTable = (FileStoreTable) createTable("FALLBACK");
+        write(mainTable, row(1, 10, 10, 2));
+        write(fallbackTable, row(2, 20, 20, 3));
+
+        TableQueryAuthResult authResult = queryAuthResult(mainTable);
+        FallbackReadFileStoreTable table =
+                new FallbackReadFileStoreTable(
+                        new QueryAuthFileStoreTable(mainTable, authResult),
+                        new QueryAuthFileStoreTable(fallbackTable, authResult),
+                        true);
+
+        List<GenericRow> result = new ArrayList<>();
+        try (RecordReader<InternalRow> reader = new IndexBootstrap(table).bootstrap(1, 0)) {
+            reader.forEachRemaining(
+                    row -> result.add(GenericRow.of(row.getInt(0), row.getInt(1), row.getInt(2))));
+        }
+
+        assertThat(result)
+                .containsExactlyInAnyOrder(GenericRow.of(10, 1, 2), GenericRow.of(20, 2, 3));
+    }
+
+    private TableQueryAuthResult queryAuthResult(FileStoreTable table) {
+        Predicate filter = new PredicateBuilder(table.rowType()).equal(0, 1);
+        return new TableQueryAuthResult(
+                Collections.singletonList(JsonSerdeUtil.toFlatJson(filter)),
+                Collections.singletonMap(
+                        "pk",
+                        JsonSerdeUtil.toFlatJson(
+                                new FieldTransform(new FieldRef(0, "pt", DataTypes.INT())))));
+    }
+
+    private static class QueryAuthFileStoreTable extends DelegatedFileStoreTable {
+
+        private final TableQueryAuthResult authResult;
+        private final boolean queryAuthEnabled;
+
+        private QueryAuthFileStoreTable(FileStoreTable wrapped, TableQueryAuthResult authResult) {
+            this(wrapped, authResult, true);
+        }
+
+        private QueryAuthFileStoreTable(
+                FileStoreTable wrapped, TableQueryAuthResult authResult, boolean queryAuthEnabled) {
+            super(wrapped);
+            this.authResult = authResult;
+            this.queryAuthEnabled = queryAuthEnabled;
+        }
+
+        @Override
+        public DataTableScan newScan() {
+            DataTableScan delegate = wrapped.newScan();
+            if (!queryAuthEnabled) {
+                return delegate;
+            }
+            DataTableScan scan =
+                    Mockito.mock(DataTableScan.class, AdditionalAnswers.delegatesTo(delegate));
+            Mockito.doAnswer(
+                            invocation -> {
+                                Filter<Integer> filter = invocation.getArgument(0);
+                                delegate.withBucketFilter(filter);
+                                return scan;
+                            })
+                    .when(scan)
+                    .withBucketFilter(Mockito.any());
+            Mockito.doAnswer(
+                            invocation -> {
+                                Filter<Integer> filter = invocation.getArgument(0);
+                                delegate.withLevelFilter(filter);
+                                return scan;
+                            })
+                    .when(scan)
+                    .withLevelFilter(Mockito.any());
+            Mockito.doAnswer(ignored -> authResult.convertPlan(delegate.plan())).when(scan).plan();
+            return scan;
+        }
+
+        @Override
+        public FileStoreTable copy(Map<String, String> dynamicOptions) {
+            return new QueryAuthFileStoreTable(
+                    wrapped.copy(dynamicOptions), authResult, queryAuthEnabled(dynamicOptions));
+        }
+
+        @Override
+        public FileStoreTable copy(TableSchema newTableSchema) {
+            return new QueryAuthFileStoreTable(
+                    wrapped.copy(newTableSchema), authResult, queryAuthEnabled);
+        }
+
+        @Override
+        public FileStoreTable copyWithoutTimeTravel(Map<String, String> dynamicOptions) {
+            return new QueryAuthFileStoreTable(
+                    wrapped.copyWithoutTimeTravel(dynamicOptions),
+                    authResult,
+                    queryAuthEnabled(dynamicOptions));
+        }
+
+        @Override
+        public FileStoreTable copyWithLatestSchema() {
+            return new QueryAuthFileStoreTable(
+                    wrapped.copyWithLatestSchema(), authResult, queryAuthEnabled);
+        }
+
+        @Override
+        public FileStoreTable switchToBranch(String branchName) {
+            return new QueryAuthFileStoreTable(
+                    wrapped.switchToBranch(branchName), authResult, queryAuthEnabled);
+        }
+
+        private boolean queryAuthEnabled(Map<String, String> dynamicOptions) {
+            String value = dynamicOptions.get(CoreOptions.QUERY_AUTH_ENABLED.key());
+            return value == null ? queryAuthEnabled : Boolean.parseBoolean(value);
+        }
+    }
+
+    private DataSplit newSplit(DataFileMeta... files) {
+        return DataSplit.builder()
+                .withSnapshot(1)
+                .withPartition(EMPTY_ROW)
+                .withBucket(0)
+                .withDataFiles(Arrays.asList(files))
+                .withBucketPath("") // not used
+                .build();
+    }
+
+    private static DataFileMeta newFile(long timeMillis) {
+        return DataFileMeta.create(
+                "",
+                1,
+                1,
+                DataFileMeta.EMPTY_MIN_KEY,
+                DataFileMeta.EMPTY_MAX_KEY,
+                EMPTY_STATS,
+                null,
+                0,
+                1,
+                0L,
+                DataFileMeta.DUMMY_LEVEL,
+                Collections.emptyList(),
+                Timestamp.fromLocalDateTime(
+                        Instant.ofEpochMilli(timeMillis)
+                                .atZone(ZoneId.systemDefault())
+                                .toLocalDateTime()),
+                0L,
+                null,
+                FileSource.APPEND,
+                null,
+                null,
+                null,
+                null,
+                null);
+    }
+
+    private Pair<InternalRow, Integer> row(int pt, int col, int pk, int bucket) {
+        GenericRow row = GenericRow.of(pt, col, pk);
+        return Pair.of(row, bucket);
+    }
+}

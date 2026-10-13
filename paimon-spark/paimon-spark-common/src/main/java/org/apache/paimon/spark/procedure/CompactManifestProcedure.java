@@ -1,0 +1,140 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark.procedure;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.operation.ManifestCompactDryRun;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.sink.BatchTableCommit;
+import org.apache.paimon.utils.ProcedureUtils;
+
+import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.catalog.Identifier;
+import org.apache.spark.sql.connector.catalog.TableCatalog;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.Metadata;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashMap;
+
+import static org.apache.spark.sql.types.DataTypes.BooleanType;
+import static org.apache.spark.sql.types.DataTypes.StringType;
+
+/**
+ * Compact manifest procedure. Usage:
+ *
+ * <pre><code>
+ *  CALL sys.compact_manifest(table => 'tableId')
+ *  CALL sys.compact_manifest(table => 'tableId', dry_run => true)
+ * </code></pre>
+ */
+public class CompactManifestProcedure extends BaseProcedure {
+
+    private static final Logger LOG = LoggerFactory.getLogger(CompactManifestProcedure.class);
+
+    private static final ProcedureParameter[] PARAMETERS =
+            new ProcedureParameter[] {
+                ProcedureParameter.required("table", StringType),
+                ProcedureParameter.optional("options", StringType),
+                ProcedureParameter.optional("dry_run", BooleanType),
+                ProcedureParameter.optional("manifest_sort_enabled", BooleanType),
+                ProcedureParameter.optional("manifest_sort_partition_field", StringType),
+                ProcedureParameter.optional("manifest_sort_max_rewrite_size", StringType)
+            };
+
+    private static final StructType OUTPUT_TYPE =
+            new StructType(
+                    new StructField[] {
+                        new StructField("result", DataTypes.BooleanType, true, Metadata.empty())
+                    });
+
+    protected CompactManifestProcedure(TableCatalog tableCatalog) {
+        super(tableCatalog);
+    }
+
+    @Override
+    public ProcedureParameter[] parameters() {
+        return PARAMETERS;
+    }
+
+    @Override
+    public StructType outputType() {
+        return OUTPUT_TYPE;
+    }
+
+    @Override
+    public InternalRow[] call(InternalRow args) {
+
+        Identifier tableIdent = toIdentifier(args.getString(0), PARAMETERS[0].name());
+        String options = args.isNullAt(1) ? null : args.getString(1);
+        boolean dryRun = !args.isNullAt(2) && args.getBoolean(2);
+        Boolean manifestSortEnabled = args.isNullAt(3) ? null : args.getBoolean(3);
+        String manifestSortPartitionField = args.isNullAt(4) ? null : args.getString(4);
+        String manifestSortMaxRewriteSize = args.isNullAt(5) ? null : args.getString(5);
+
+        Table table = loadSparkTable(tableIdent).getTable();
+        HashMap<String, String> dynamicOptions = new HashMap<>();
+        ProcedureUtils.putAllOptions(dynamicOptions, options);
+        if (manifestSortEnabled != null) {
+            dynamicOptions.put(
+                    CoreOptions.MANIFEST_SORT_ENABLED.key(), Boolean.toString(manifestSortEnabled));
+        }
+        if (manifestSortPartitionField != null) {
+            dynamicOptions.put(
+                    CoreOptions.MANIFEST_SORT_PARTITION_FIELD.key(), manifestSortPartitionField);
+        }
+        if (manifestSortMaxRewriteSize != null) {
+            dynamicOptions.put(
+                    CoreOptions.MANIFEST_SORT_MAX_REWRITE_SIZE.key(), manifestSortMaxRewriteSize);
+        }
+        table = table.copy(dynamicOptions);
+
+        if (dryRun) {
+            String message = ManifestCompactDryRun.execute((FileStoreTable) table);
+            LOG.info(message);
+            return new InternalRow[] {newInternalRow(true)};
+        }
+
+        try (BatchTableCommit commit = table.newBatchWriteBuilder().newCommit()) {
+            commit.compactManifests();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        return new InternalRow[] {newInternalRow(true)};
+    }
+
+    @Override
+    public String description() {
+        return "This procedure execute compact action on paimon table.";
+    }
+
+    public static ProcedureBuilder builder() {
+        return new Builder<CompactManifestProcedure>() {
+            @Override
+            public CompactManifestProcedure doBuild() {
+                return new CompactManifestProcedure(tableCatalog());
+            }
+        };
+    }
+}
